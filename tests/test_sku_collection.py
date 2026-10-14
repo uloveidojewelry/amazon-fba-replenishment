@@ -418,3 +418,93 @@ def test_precheck_identifiable_inbound_quantity_conflict_is_soft(tmp_path):
     report, _, _ = precheck_sku(api, tmp_path, ASOF, 'UTC')
     assert report['expansion_allowed'] and not report['hard_errors']
     assert report['inbound_quantity_exception_rows'] == 1
+
+
+
+def test_inventory_expiration_restarts_once_then_accepts_only_fresh_full_snapshot(monkeypatch):
+    import fba_replenishment.sku_collection as module
+    from fba_replenishment.spapi import SPAPIError
+    calls = []
+    fresh = [inventory('fresh')]
+    def collect(client, cache_dir, force=False, ttl_hours=1):
+        calls.append((force, ttl_hours))
+        if len(calls) == 1:
+            raise SPAPIError('Inventory pagination expired', 'INVENTORY_PAGINATION_EXPIRED')
+        return fresh, inventory_audit(fresh)
+    monkeypatch.setattr(module, 'collect_inventory_snapshot', collect)
+    rows, audit = module.collect_sku_inventory_snapshot(object(), 'cache', force=True, ttl_hours=2)
+    assert rows == fresh and audit['restart_count'] == 1
+    assert calls == [(True, 2), (True, 2)]
+
+
+def test_inventory_expiration_stops_after_three_complete_attempts(monkeypatch):
+    import fba_replenishment.sku_collection as module
+    from fba_replenishment.spapi import SPAPIError
+    calls = []
+    def collect(*args, **kwargs):
+        calls.append(1)
+        raise SPAPIError('Inventory pagination expired', 'INVENTORY_PAGINATION_EXPIRED')
+    monkeypatch.setattr(module, 'collect_inventory_snapshot', collect)
+    with pytest.raises(SPAPIError) as error:
+        module.collect_sku_inventory_snapshot(object(), 'cache')
+    assert len(calls) == 3
+    assert error.value.code == 'INVENTORY_PAGINATION_EXPIRED'
+    assert error.value.restart_count == 2
+
+
+@pytest.mark.parametrize('code', ['SPAPI_HTTP_400', 'SPAPI_HTTP_429', 'TLS_ERROR', 'PROXY_ERROR'])
+def test_other_inventory_errors_are_never_treated_as_expiration(monkeypatch, code):
+    import fba_replenishment.sku_collection as module
+    from fba_replenishment.spapi import SPAPIError
+    calls = []
+    def collect(*args, **kwargs):
+        calls.append(1)
+        raise SPAPIError('Safe failure', code)
+    monkeypatch.setattr(module, 'collect_inventory_snapshot', collect)
+    with pytest.raises(SPAPIError) as error:
+        module.collect_sku_inventory_snapshot(object(), 'cache')
+    assert len(calls) == 1 and error.value.code == code
+
+
+def test_all_expired_inventory_attempts_preserve_previous_atomic_checkpoint(tmp_path):
+    from fba_replenishment.collection import collect_inventory_snapshot
+    from fba_replenishment.sku_collection import collect_sku_inventory_snapshot
+    from fba_replenishment.spapi import SPAPIError
+    class InventoryAPI:
+        marketplace = MARKETPLACE
+        endpoint = 'https://sellingpartnerapi-na.amazon.com'
+        orders_version = '2026-01-01'
+        collection_complete = {}
+        calls = 0
+        expired = False
+        def inventory_summaries(self):
+            self.calls += 1
+            if self.expired:
+                self.collection_complete['/fba/inventory/v1/summaries'] = False
+                raise SPAPIError('Inventory pagination expired', 'INVENTORY_PAGINATION_EXPIRED')
+            self.collection_complete['/fba/inventory/v1/summaries'] = True
+            return [inventory()]
+    api = InventoryAPI()
+    collect_inventory_snapshot(api, tmp_path)
+    checkpoint = next(tmp_path.rglob('inventory.json'))
+    before = checkpoint.read_bytes()
+    api.expired = True
+    with pytest.raises(SPAPIError):
+        collect_sku_inventory_snapshot(api, tmp_path, force=True)
+    assert api.calls == 4
+    assert checkpoint.read_bytes() == before
+    assert not list(tmp_path.rglob('*.tmp'))
+
+
+def test_precheck_uses_inventory_restart_wrapper(monkeypatch, tmp_path):
+    import fba_replenishment.sku_collection as module
+    api = ProbeAPI()
+    calls = []
+    def wrapper(client, cache_dir, force=False, ttl_hours=1):
+        calls.append(1)
+        rows = [inventory()]
+        return rows, dict(inventory_audit(rows), restart_count=1)
+    monkeypatch.setattr(module, 'collect_sku_inventory_snapshot', wrapper)
+    report, _, audit = module.precheck_sku(api, tmp_path, ASOF, 'UTC')
+    assert calls == [1]
+    assert report['expansion_allowed'] and audit['restart_count'] == 1

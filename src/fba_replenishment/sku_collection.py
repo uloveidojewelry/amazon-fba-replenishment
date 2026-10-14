@@ -42,6 +42,26 @@ def collect_sku_inbound_snapshot(client, cache_dir, force=False, ttl_hours=1,
                                    allow_quantity_exceptions=True)
 
 
+def collect_sku_inventory_snapshot(client, cache_dir, force=False, ttl_hours=1):
+    """Restart only an explicitly expired inventory pagination chain.
+
+Each attempt begins at the first page through the existing atomic collector.
+Incomplete page sets never mix, and HTTP 400 without the specific expiration
+code is never retried. Three attempts permit at most two full restarts.
+"""
+    for attempt in range(3):
+        try:
+            inventory, audit = collect_inventory_snapshot(
+                client, cache_dir, force=force, ttl_hours=ttl_hours)
+            return inventory, dict(audit, restart_count=attempt)
+        except SPAPIError as error:
+            if error.code != 'INVENTORY_PAGINATION_EXPIRED':
+                raise
+            if attempt == 2:
+                error.restart_count = attempt
+                raise
+
+
 def _pending_skus(orders, items):
     return sorted({item['SellerSKU'] for order in orders
                    if order['OrderStatus'] in PENDING_STATUSES
@@ -55,7 +75,7 @@ No candidate/family mapping is consulted. Known pending SKUs and historical
 sales SKUs absent from current inventory are soft exceptions. Malformed or
 unidentifiable data and permission errors prevent sales expansion.
 """
-    inventory, inventory_audit = collect_inventory_snapshot(client, cache_dir)
+    inventory, inventory_audit = collect_sku_inventory_snapshot(client, cache_dir)
     _, _, begin, finish = _boundaries(asof, timezone_name, 2)
     report = {
         'mode': 'independent_sku_precheck', 'begin': begin.isoformat(),

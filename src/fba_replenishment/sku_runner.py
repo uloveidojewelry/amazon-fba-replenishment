@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from .collection import CollectionQualityError, collect_sales_shards, collect_inventory_snapshot
+from .collection import CollectionQualityError, collect_sales_shards
 from .config import US_MARKETPLACE
 from .core import connect, log_sync
 from .mock import is_mock_database
@@ -28,7 +28,7 @@ The existing SPAPIClient retains its bounded retry/authentication behavior.
 """
     DEFAULT_INTERVALS = {
         'ORDERS_SEARCH': 2.0, 'ORDERS_ITEMS': 2.0, 'ORDERS_GET': 2.0,
-        'FBA_INVENTORY': 0.5, 'INBOUND_SHIPMENTS': 0.5,
+        'FBA_INVENTORY': 1.0, 'INBOUND_SHIPMENTS': 0.5,
         'INBOUND_ITEMS': 0.5, 'CATALOG_ITEMS': 0.5, 'LWA': 0.0, 'OTHER': 0.0,
     }
 
@@ -40,6 +40,9 @@ The existing SPAPIClient retains its bounded retry/authentication behavior.
         self.operation_intervals = dict(self.DEFAULT_INTERVALS)
         self.throttle_audit = {}
         self._next_allowed = {}
+        # Inventory nextToken expires after 30 seconds. Keep only its age,
+        # never the token, and leave five seconds of request-time margin.
+        self._inventory_cursor_observed_at = None
         self._request_lock = threading.Lock()
 
     @staticmethod
@@ -109,23 +112,41 @@ The existing SPAPIClient retains its bounded retry/authentication behavior.
                 'requests': 0, 'rate_updates': 0, 'rate_limits': 0,
                 'wait_events': 0, 'wait_seconds': 0.0,
             })
+            continuation = (operation == 'FBA_INVENTORY'
+                            and 'nextToken' in (kwargs.get('params') or {}))
+            if operation == 'FBA_INVENTORY' and not continuation:
+                self._inventory_cursor_observed_at = None
             self._wait(operation)
+            if continuation and (self._inventory_cursor_observed_at is None
+                    or self.clock() - self._inventory_cursor_observed_at >= 25.0):
+                stats['expired_cursor_restarts'] = stats.get('expired_cursor_restarts', 0) + 1
+                raise SPAPIError('Inventory pagination expired; restart complete snapshot',
+                                 'INVENTORY_PAGINATION_EXPIRED')
             started = self.clock()
             self._next_allowed[operation] = started + self.operation_intervals[operation]
             stats['requests'] += 1
             response = super().request(*args, **kwargs)
             self.http_status_counts[str(response.status_code)] += 1
             if response.status_code == 200:
+                if operation == 'FBA_INVENTORY':
+                    self._inventory_cursor_observed_at = self.clock()
                 rate = self._number(response.headers.get('x-amzn-RateLimit-Limit'))
                 if rate is not None:
                     interval = 1.0 / rate
+                    if operation == 'FBA_INVENTORY':
+                        interval = max(1.0, interval)
                     if math.isfinite(interval) and interval > 0:
                         self.operation_intervals[operation] = interval
                         self._next_allowed[operation] = started + interval
                         stats['rate_updates'] += 1
             elif response.status_code == 429:
                 delay = self._number(response.headers.get('Retry-After'))
-                cooldown = min(120.0, delay) if delay is not None else 60.0
+                if operation == 'FBA_INVENTORY':
+                    # Respect explicit server cooldowns, even when they force
+                    # a fresh snapshot instead of reuse of an expired cursor.
+                    cooldown = delay if delay is not None else 2.0
+                else:
+                    cooldown = min(120.0, delay) if delay is not None else 60.0
                 self._next_allowed[operation] = max(self._next_allowed[operation],
                                                     self.clock() + cooldown)
                 stats['rate_limits'] += 1
@@ -186,7 +207,8 @@ def _save(path, value):
 def run_sku_collection(client, database_path, output_dir, *, source_path=None,
                        asof=None, timezone_name='America/Los_Angeles', shard_days=7,
                        force=False, precheck_only=False, settings=None, progress=None):
-    from .sku_collection import precheck_sku, reconcile_sku_data, collect_sku_inbound_snapshot
+    from .sku_collection import (precheck_sku, reconcile_sku_data,
+                                 collect_sku_inbound_snapshot, collect_sku_inventory_snapshot)
     from .sku_plan import calculate_skus
     from .sku_export import export_sku_report
 
@@ -240,7 +262,7 @@ def run_sku_collection(client, database_path, output_dir, *, source_path=None,
         # checkpoint at calculation time, rather than the precheck's old stock.
         stage = 'INVENTORY_REFRESH'
         emit(stage)
-        inventory,inventory_audit=collect_inventory_snapshot(client,dest/'checkpoints',force=force)
+        inventory,inventory_audit=collect_sku_inventory_snapshot(client,dest/'checkpoints',force=force)
         _save(dest/'inventory_final_audit.json',inventory_audit)
         stage = 'INBOUND'
         emit(stage)

@@ -7,6 +7,7 @@ import requests
 from requests.structures import CaseInsensitiveDict
 
 from fba_replenishment.sku_runner import SafeCountSession
+from fba_replenishment.spapi import SPAPIError
 
 
 ORDERS = 'https://sellingpartnerapi-na.amazon.com/orders/2026-01-01/orders'
@@ -55,9 +56,9 @@ def test_orders_initial_two_seconds_and_inventory_has_independent_budget(monkeyp
     api.request('GET', INVENTORY)
     api.request('GET', ORDERS)
     api.request('GET', ORDERS)
-    assert times == [0, 0, .5, 2, 4]
+    assert times == [0, 0, 1, 2, 4]
     assert api.http_status_counts == {'200': 5}
-    assert api.throttle_audit['ORDERS_SEARCH']['wait_seconds'] == 3.5
+    assert api.throttle_audit['ORDERS_SEARCH']['wait_seconds'] == 3
     assert not events
 
 
@@ -133,8 +134,8 @@ def test_inventory_and_inbound_update_independently_and_continuations_share_item
     api.request('GET', INVENTORY)
     api.request('GET', INBOUND + '/private-shipment/items')
     api.request('GET', 'https://sellingpartnerapi-na.amazon.com/fba/inbound/v0/shipmentItems')
-    assert times == pytest.approx([0, 0, .25, .25, .45])
-    assert api.operation_intervals['FBA_INVENTORY'] == .25
+    assert times == pytest.approx([0, 0, 1, 1, 1.2])
+    assert api.operation_intervals['FBA_INVENTORY'] == 1
     assert api.operation_intervals['INBOUND_SHIPMENTS'] == .5
     assert api.throttle_audit['INBOUND_ITEMS']['requests'] == 2
 
@@ -167,3 +168,46 @@ def test_http_progress_keeps_existing_fifty_response_safe_count_reporting(monkey
     for _ in range(50):
         api.request('POST', 'https://api.amazon.com/auth/o2/token')
     assert events == [{'stage': 'READ_ONLY_HTTP', 'http_status_counts': {'200': 50}}]
+
+
+def test_inventory_429_without_retry_after_preserves_fresh_cursor(monkeypatch):
+    api, clock, events, times = session(monkeypatch, [Response(), Response(429), Response()])
+    api.request('GET', INVENTORY)
+    for _ in range(2):
+        api.request('GET', INVENTORY, params={'nextToken': 'TEST-ONLY-NOT-PERSISTED'})
+    assert times == [0, 1, 3]
+    assert 'TEST-ONLY' not in json.dumps([api.throttle_audit, events, api.__dict__], default=str)
+
+
+def test_inventory_explicit_cooldown_waited_before_expired_cursor_is_rejected(monkeypatch):
+    api, clock, events, times = session(monkeypatch, [
+        Response(), Response(429, {'Retry-After': '60'}), Response()])
+    api.request('GET', INVENTORY)
+    api.request('GET', INVENTORY, params={'nextToken': 'TEST-ONLY'})
+    with pytest.raises(SPAPIError) as error:
+        api.request('GET', INVENTORY, params={'nextToken': 'TEST-ONLY'})
+    assert error.value.code == 'INVENTORY_PAGINATION_EXPIRED'
+    assert times == [0, 1] and clock() == 61
+    # Retry starts at the first page, respecting the previous server deadline.
+    api.request('GET', INVENTORY)
+    assert times == [0, 1, 61]
+    assert api.throttle_audit['FBA_INVENTORY']['expired_cursor_restarts'] == 1
+
+
+def test_inventory_cursor_age_not_refreshed_by_other_operations(monkeypatch):
+    api, clock, _, times = session(monkeypatch, [Response(), Response()])
+    api.request('GET', INVENTORY)
+    clock.sleep(25)
+    api.request('GET', INBOUND)
+    with pytest.raises(SPAPIError) as error:
+        api.request('GET', INVENTORY, params={'nextToken': 'TEST-ONLY'})
+    assert error.value.code == 'INVENTORY_PAGINATION_EXPIRED' and times == [0, 25]
+
+
+def test_inventory_respects_lower_rate_and_does_not_reclassify_http400(monkeypatch):
+    api, clock, _, times = session(monkeypatch, [
+        Response(headers={'x-amzn-RateLimit-Limit': '.5'}), Response(400)])
+    api.request('GET', INVENTORY)
+    response = api.request('GET', INVENTORY, params={'nextToken': 'TEST-ONLY'})
+    assert response.status_code == 400 and times == [0, 2]
+    assert api.operation_intervals['FBA_INVENTORY'] == 2
