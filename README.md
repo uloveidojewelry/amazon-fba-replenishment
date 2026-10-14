@@ -1,6 +1,6 @@
 # Amazon FBA Replenishment — read-only planning
 
-Python 3.10+ / SQLite / requests / openpyxl. No shipment, listing, purchase-order or other Amazon business write operation exists. Only LWA token exchange uses POST; business collection is allowlisted GET.
+Python 3.10+ / SQLite / requests / openpyxl. No shipment, listing, purchase-order or other Amazon business write operation exists. Only LWA token exchange uses POST; business collection is allowlisted GET. Live requests require explicit `--confirm-read-only`; the default diagnostic and mock mode are offline.
 
 ## Install and test
 
@@ -36,14 +36,15 @@ Configure environment bindings securely in environment settings; `.env.example` 
 - `SP_API_LWA_CLIENT_ID`, `SP_API_LWA_CLIENT_SECRET`, `SP_API_REFRESH_TOKEN`: authorized seller application LWA credentials.
 - `SP_API_MARKETPLACE_ID`: actual Amazon marketplace ID (default US `ATVPDKIKX0DER`).
 - `SP_API_ENDPOINT`: correct regional HTTPS endpoint, default `https://sellingpartnerapi-na.amazon.com`.
+- `SP_API_ORDERS_VERSION`: default `2026-01-01`; `v0` is an explicit deprecated compatibility option.
 - `SP_API_TIMEZONE`: IANA timezone for daily sales, default UTC. Choose before first sales sync. For US business-day accounting, e.g. `America/Los_Angeles`; do not silently mix timezones.
 
 ```bash
-fba-plan --marketplace US sync --kind all
+fba-plan --marketplace US sync --kind all --confirm-read-only
 # Optional individual refreshes:
-fba-plan --marketplace US sync --kind sales --asof 2026-10-13 --timezone UTC
-fba-plan --marketplace US sync --kind stock
-fba-plan --marketplace US sync --kind inbound
+fba-plan --marketplace US sync --kind sales --asof 2026-10-13 --timezone UTC --confirm-read-only
+fba-plan --marketplace US sync --kind stock --confirm-read-only
+fba-plan --marketplace US sync --kind inbound --confirm-read-only
 fba-plan --marketplace US plan --output output/replenishment.xlsx
 ```
 
@@ -53,12 +54,12 @@ Implemented collectors:
 
 | Data | Official read operation | Local behavior |
 |---|---|---|
-| Orders | Orders v0 `getOrders` | AFN only, full creation-date window, all pages, canceled excluded; unresolved pending statuses reject the sales snapshot |
-| Order items / sales | Orders v0 `getOrderItems` | All pages, item identity deduplication, gross ordered units by purchase day; fill verified absent dates with zero for mapped SKUs |
+| Orders | Orders 2026-01-01 `searchOrders` (v0 explicit compatibility) | AFN only, full creation-date window, all pages, canceled excluded; unresolved pending statuses reject the sales snapshot |
+| Order items / sales | Embedded `orderItems` in 2026 search responses (v0 `getOrderItems` compatibility) | All search pages, item identity deduplication, executed item cancellations excluded, gross ordered units by purchase day; fill verified absent dates with zero for mapped SKUs |
 | FBA stock | Inventory v1 `getInventorySummaries` | No incremental date/SKU filter; top-level pagination; aggregate distinct condition/FNSKU identities, require quantity details; full marketplace replacement |
 | Inbound shipments | Fulfillment Inbound v0 `getShipments`, `getShipmentItems` | All statuses/pages; continuation items use `getShipmentItemsByNextToken`; remaining units = max(0, shipped-received); reconcile disappeared/terminal shipments |
 
-Collectors strip customer fields. Only order ID, item ID, SKU, day, status, and units are persisted. Missing required fields, repeated pagination tokens, ambiguous identities and API errors fail closed. Rate limits/transient failures have bounded retries; 401 refreshes once. Error messages and sync logs omit response bodies/tokens. TLS verification remains enabled.
+Collectors strip customer fields. Only order ID, item ID, SKU, day, status, and units are persisted. New Orders requests use `FULFILLMENT,CANCELLATION`, never BUYER/RECIPIENT datasets. Redirects are rejected; TLS/proxy failures have safe error codes without response-body logging. Missing required fields, repeated pagination tokens, ambiguous identities and API errors fail closed. Rate limits/transient failures have bounded retries; 401 refreshes once. Error messages and sync logs omit response bodies/tokens. TLS verification remains enabled.
 
 `sync --kind all` fetches and validates **all** collections before a single SQLite transaction. Failure retains previous snapshots and records `FAILED`; plans block until the affected sources have successful refreshes or verified CSV replacements. Inventory absent from a successful full response is removed, not treated as zero. Sales re-sync replaces the 30-day window so subsequent cancellations are reconciled. SQLite `snapshots`, `sync_log`, and `audit` retain input versions and actions. Do not mix sellers inside one marketplace namespace/database.
 
@@ -76,7 +77,7 @@ Workbook sheets: Replenishment, Alerts, Sales, Inventory, Inbound, Orders, Sync 
 
 ## Permissions and remaining work
 
-Enable the seller-authorized SP-API app with **Inventory and Order Tracking** (Orders/FBA Inventory) and **Amazon Fulfillment** (Fulfillment Inbound) roles as applicable, then authorize the application for the target seller/marketplace. Roles remain subject to Amazon approval and actual endpoint 403 validation. These collectors need no buyer/address restricted-data access or RDT; they never call buyerInfo/address APIs.
+Enable the seller-authorized SP-API app with **Inventory and Order Tracking** (Orders/FBA Inventory) and **Amazon Fulfillment** (Fulfillment Inbound) roles as applicable, then authorize the application for the target seller/marketplace. These role names are preparation requirements, not proof of current approval: the live documentation website was proxy-blocked during this phase. Latest official models were retrieved; roles remain subject to current Amazon approval and a separately confirmed endpoint smoke test. These collectors need no buyer/address restricted-data access or RDT; they never call buyerInfo/address APIs.
 
 Allow HTTPS to `api.amazon.com` and the selected regional host (`sellingpartnerapi-na.amazon.com`, `sellingpartnerapi-eu.amazon.com`, or `sellingpartnerapi-fe.amazon.com`). Keep existing package/GitHub network presets. No inbound service port is needed.
 
@@ -86,3 +87,30 @@ Official models checked during development:
 - https://github.com/amzn/selling-partner-api-models/blob/main/models/orders-api-model/ordersV0.json
 - https://github.com/amzn/selling-partner-api-models/blob/main/models/fba-inventory-api-model/fbaInventory.json
 - https://github.com/amzn/selling-partner-api-models/blob/main/models/fulfillment-inbound-api-model/fulfillmentInboundV0.json
+
+
+## Connection preparation and offline diagnostics
+
+See [Seller Central authorization and Codex Secrets guide](docs/SP_API_SETUP.zh-CN.md) for current-model findings, roles, exact variable names, safe error codes and authorization steps.
+
+```bash
+# No network, no SQLite file creation, no credential values:
+fba-plan diagnose-spapi
+# In-memory synthetic collection, complete 30-day data and family-stop verification:
+fba-plan diagnose-spapi --mock
+# Isolated synthetic store, no credentials needed; defaults to output/mock-fba.db:
+fba-plan sync --mock
+fba-plan --db output/mock-fba.db plan --output output/mock-replenishment.xlsx
+```
+
+Mock snapshots are labeled `MOCK`, the workbook mode is `SIMULATED_READ_ONLY`, and simulated orders/shipments have SIMULATED IDs. The mock DB starts with the J001 family stopped and J002 active. Mock mode refuses existing real data; live sync refuses mock databases. The uploaded one-day CSVs and their original sample workbook are unchanged.
+
+Only after explicit user confirmation and secure credential configuration:
+
+```bash
+fba-plan diagnose-spapi --live --confirm-read-only
+```
+
+This authenticates via LWA and checks one response page for each of Inventory, Orders and Inbound. It prints only status/counts/safe errors, does not write a DB, and does not certify a complete snapshot. Requests may retry within the bounded retry budget. A token success alone does not validate all roles. Default offline exit code 0 means syntactically valid configuration, not working credentials or a connected store; check `configuration_complete`, `authentication_verified` and `checks` separately. Failed/blocked diagnostics exit 1; unconfirmed live sync exits 2 without creating a DB.
+
+Official model review found Orders v0 GET operations marked `deprecated: true` and the 2026-01-01 replacement. No retirement date is inferred from that flag. The 2026 adapter uses camelCase parameters, top-level `orders`/`pagination.nextToken`, and embedded item records. It has offline tests only. FBA Inventory remains v1; retained Inbound v0 read operations are in the current model and are not marked deprecated there. Inbound 2024-03-20 is a separate API, not a reason to call its shipment creation/confirmation operations.

@@ -30,12 +30,13 @@ def credentials(monkeypatch):
     for key in ['SP_API_LWA_CLIENT_ID', 'SP_API_LWA_CLIENT_SECRET', 'SP_API_REFRESH_TOKEN']:
         monkeypatch.setenv(key, 'fake-offline-test-value')
     monkeypatch.delenv('SP_API_ENDPOINT', raising=False)
+    monkeypatch.setenv('SP_API_ORDERS_VERSION', 'v0')
 
 
 def client(responses):
     s = Session([Response(200, {'access_token': 'offline-token', 'expires_in': 3600}), *responses])
     delays = []
-    return SPAPIClient(s, sleep=delays.append), s, delays
+    return SPAPIClient(s, sleep=delays.append, allow_live=True), s, delays
 
 
 def test_inventory_full_snapshot_pagination():

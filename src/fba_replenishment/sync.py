@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from .core import log_sync, now, record_snapshot, units
 from .spapi import SPAPIError, SHIPMENT_STATUSES
+from .mock import is_mock_database
 
 
 def required(row, key):
@@ -109,6 +110,9 @@ def sync(con, client, marketplace, kind='all', asof=None, timezone_name='UTC'):
     asof = date.fromisoformat(asof) if asof else datetime.now(zone).date() - timedelta(days=1)
     kinds = ['stock', 'sales', 'inbound'] if kind == 'all' else [kind]
     stock = sales = inbound = None
+    data_source = getattr(client, 'data_source', 'SP-API')
+    if (data_source == 'MOCK') != is_mock_database(con):
+        raise ValueError('Mock and live sources require separate database modes')
     try:
         binding = con.execute('SELECT * FROM marketplace_binding WHERE marketplace=?', (marketplace,)).fetchone()
         if binding and binding['api_marketplace'] != client.marketplace:
@@ -142,18 +146,18 @@ def sync(con, client, marketplace, kind='all', asof=None, timezone_name='UTC'):
                 con.executemany('INSERT INTO sales VALUES(?,?,?,?)', [(marketplace, sku, day, quantity) for (sku, day), quantity in totals.items()])
                 con.executemany('INSERT INTO order_line VALUES(?,?,?,?,?,?,?)', [(marketplace, *line) for line in lines])
                 counts['sales'] = len(totals)
-                record_snapshot(con, marketplace, 'order_line', 'SP-API')
+                record_snapshot(con, marketplace, 'order_line', data_source)
             if inbound is not None:
                 rows, shipments = inbound
                 con.execute('DELETE FROM inbound WHERE marketplace=?', (marketplace,))
                 con.executemany('INSERT INTO inbound VALUES(?,?,?,?,?,?)', [(marketplace, *row) for row in rows])
                 counts['inbound'] = len(rows)
                 con.execute('INSERT INTO snapshots(at,marketplace,kind,source,data) VALUES(?,?,?,?,?)',
-                            (timestamp, marketplace, 'shipments', 'SP-API', json.dumps(shipments)))
+                            (timestamp, marketplace, 'shipments', data_source, json.dumps(shipments)))
             for source in kinds:
-                record_snapshot(con, marketplace, source, 'SP-API')
+                record_snapshot(con, marketplace, source, data_source)
                 log_sync(con, marketplace, source, 'SUCCESS', counts[source],
-                         f'Full collection reconciled; API marketplace={client.marketplace}; timezone={timezone_name}; asof={asof}')
+                         f'{data_source}: Full collection reconciled; API marketplace={client.marketplace}; timezone={timezone_name}; asof={asof}')
             con.execute('INSERT INTO audit(at,action,marketplace,sku,detail) VALUES(?,?,?,?,?)',
                         (timestamp, 'SYNC', marketplace, '', ','.join(kinds)))
         return counts

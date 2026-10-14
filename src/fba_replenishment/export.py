@@ -2,6 +2,7 @@
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+from .mock import is_mock_database
 
 COLUMNS = ['marketplace', 'sku', 'family', 'asin', 'sales_30d', 'observed_sales_days',
            'daily_sales', 'fulfillable', 'reserved', 'unfulfillable', 'stock_observed_at',
@@ -53,7 +54,7 @@ def export(rows, path, con=None, marketplace=None, settings=None):
         for key in ['asof', 'window_start', 'lead_days', 'target_days', 'safety_days', 'moq', 'case_pack', 'sales_timezone']:
             if parameters.get(key) is None:
                 parameters[key] = rows[0][key]
-    parameters.update({'marketplace': marketplace, 'mode': 'READ_ONLY',
+    parameters.update({'marketplace': marketplace, 'mode': 'SIMULATED_READ_ONLY' if con is not None and is_mock_database(con) else 'READ_ONLY',
                        'sales_basis': 'Daily gross ordered AFN units; canceled orders excluded; not net returns',
                        'formula': 'ceil to case pack(max(MOQ, daily_sales * horizon - fulfillable - eligible_inbound)) if positive',
                        'inbound_policy': 'Unknown ETA blocks planning; terminal/working shipments excluded',

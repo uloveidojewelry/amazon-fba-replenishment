@@ -10,13 +10,12 @@ from urllib.parse import quote
 
 import requests
 
-ENDPOINTS = {
-    'https://sellingpartnerapi-na.amazon.com',
-    'https://sellingpartnerapi-eu.amazon.com',
-    'https://sellingpartnerapi-fe.amazon.com',
-}
+from .config import CREDENTIAL_NAMES, ENDPOINTS, SPAPIConfig, credential_presence
+
 READ_PATHS = (
     r'/fba/inventory/v1/summaries',
+    r'/orders/2026-01-01/orders',
+    r'/orders/2026-01-01/orders/[^/]+',
     r'/orders/v0/orders',
     r'/orders/v0/orders/[^/]+/orderItems',
     r'/fba/inbound/v0/shipments',
@@ -30,32 +29,49 @@ SHIPMENT_STATUSES = ('WORKING', 'SHIPPED', 'RECEIVING', 'CANCELLED', 'DELETED',
 class SPAPIError(RuntimeError):
     """Safe error text: never includes a response body, token or customer data."""
 
+    def __init__(self, message, code='SPAPI_ERROR', hint='Check configuration and seller authorization'):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
 
 class SPAPIClient:
-    def __init__(self, session=None, sleep=time.sleep):
-        names = ('SP_API_LWA_CLIENT_ID', 'SP_API_LWA_CLIENT_SECRET', 'SP_API_REFRESH_TOKEN')
-        missing = [name for name in names if not os.environ.get(name)]
+    def __init__(self, session=None, sleep=time.sleep, allow_live=False):
+        try:
+            config = SPAPIConfig.from_env()
+        except ValueError as error:
+            raise SPAPIError(str(error), 'INVALID_CONFIGURATION') from None
+        missing = [name for name, present in credential_presence().items() if not present]
         if missing:
-            raise SPAPIError('Missing environment bindings: ' + ', '.join(missing))
-        self.client_id, self.secret, self.refresh = (os.environ[name] for name in names)
-        self.endpoint = os.environ.get('SP_API_ENDPOINT', 'https://sellingpartnerapi-na.amazon.com').rstrip('/')
-        if self.endpoint not in ENDPOINTS:
-            raise SPAPIError('SP_API_ENDPOINT must be an official regional HTTPS endpoint')
-        self.marketplace = os.environ.get('SP_API_MARKETPLACE_ID', 'ATVPDKIKX0DER')
+            raise SPAPIError('Missing environment bindings: ' + ', '.join(missing),
+                             'MISSING_CREDENTIALS', 'Set bindings securely in environment settings')
+        self.client_id, self.secret, self.refresh = (os.environ[name] for name in CREDENTIAL_NAMES)
+        self.endpoint, self.marketplace = config.endpoint, config.marketplace
+        self.orders_version = config.orders_version
         self.session = session or requests.Session()
         self.sleep = sleep
+        self.allow_live = allow_live
         self.token = None
         self.expires = 0
+        self._order_items = {}
 
     def _request(self, method, url, **kwargs):
+        if not self.allow_live:
+            raise SPAPIError('Live requests require explicit read-only confirmation', 'CONFIRMATION_REQUIRED')
         for attempt in range(5):
             try:
-                response = self.session.request(method, url, timeout=45, **kwargs)
+                response = self.session.request(method, url, timeout=45, allow_redirects=False, **kwargs)
+            except requests.exceptions.SSLError:
+                raise SPAPIError('TLS verification failed', 'TLS_ERROR', 'Repair CA trust; never disable TLS verification') from None
+            except requests.exceptions.ProxyError:
+                raise SPAPIError('Network proxy refused or failed the connection', 'PROXY_ERROR', 'Check allowed domains and managed proxy readiness') from None
             except requests.RequestException:
                 if attempt == 4:
-                    raise SPAPIError('Network request failed') from None
+                    raise SPAPIError('Network request failed', 'NETWORK_ERROR', 'Check network reachability and timeout') from None
                 self.sleep(min(30, 2 ** attempt))
                 continue
+            if 300 <= response.status_code < 400:
+                raise SPAPIError('Redirect rejected to protect credentials', 'REDIRECT_BLOCKED')
             if response.status_code in (429, 500, 502, 503, 504) and attempt < 4:
                 try:
                     delay = float(response.headers.get('Retry-After', 2 ** attempt))
@@ -74,7 +90,15 @@ class SPAPIClient:
             'client_id': self.client_id, 'client_secret': self.secret,
         })
         if response.status_code != 200:
-            raise SPAPIError(f'LWA HTTP {response.status_code}')
+            code = 'LWA_HTTP_ERROR'
+            try:
+                body = response.json()
+                if isinstance(body, dict) and body.get('error') in ('invalid_grant', 'invalid_client'):
+                    code = 'LWA_' + body['error'].upper()
+            except ValueError:
+                pass
+            raise SPAPIError(f'LWA HTTP {response.status_code}', code,
+                             'Check matching app credentials, seller authorization, rotation/revocation; reauthorize if needed')
         try:
             data = response.json()
             token = data['access_token']
@@ -97,7 +121,11 @@ class SPAPIClient:
                 self.token = None
                 continue
             if response.status_code != 200:
-                raise SPAPIError(f'SP-API HTTP {response.status_code}')
+                hints = {401: 'Check token validity and app/seller authorization',
+                         403: 'Check approved roles, seller consent, marketplace access and proxy policy',
+                         429: 'Rate limit exhausted; wait before another confirmed attempt'}
+                raise SPAPIError(f'SP-API HTTP {response.status_code}', f'SPAPI_HTTP_{response.status_code}',
+                                 hints.get(response.status_code, 'Check API version, request parameters and service status'))
             try:
                 data = response.json()
             except ValueError:
@@ -112,12 +140,17 @@ class SPAPIClient:
         results, seen = [], set()
         params = dict(params)
         while True:
-            data = self.get(path, params)
+            data = self.get(path, dict(params))
             payload = data.get('payload')
             if not isinstance(payload, dict) or not isinstance(payload.get(rows_key), list):
                 raise SPAPIError('Missing collection in API response')
+            if not all(isinstance(row, dict) for row in payload[rows_key]):
+                raise SPAPIError('Malformed collection record')
             results.extend(payload[rows_key])
-            token = ((data.get('pagination') or {}).get('nextToken') if inventory
+            pagination = data.get('pagination') or {}
+            if inventory and not isinstance(pagination, dict):
+                raise SPAPIError('Malformed inventory pagination')
+            token = (pagination.get('nextToken') if inventory
                      else payload.get(token_key))
             if not token:
                 return results
@@ -139,6 +172,8 @@ class SPAPIClient:
         }, 'inventorySummaries', 'nextToken', inventory=True)
 
     def orders(self, created_after, created_before):
+        if self.orders_version == '2026-01-01':
+            return self._orders_2026(created_after, created_before)
         raw = self._pages('/orders/v0/orders', {
             'MarketplaceIds': self.marketplace, 'CreatedAfter': created_after,
             'CreatedBefore': created_before, 'FulfillmentChannels': 'AFN',
@@ -148,6 +183,10 @@ class SPAPIClient:
         return [{key: row.get(key) for key in keys} for row in raw]
 
     def order_items(self, order_id):
+        if self.orders_version == '2026-01-01':
+            if order_id not in self._order_items:
+                raise SPAPIError('Order items must come from the current searchOrders snapshot')
+            return [dict(item) for item in self._order_items[order_id]]
         path = '/orders/v0/orders/' + quote(order_id, safe='') + '/orderItems'
         raw = self._pages(path, {}, 'OrderItems')
         keys = ('OrderItemId', 'SellerSKU', 'ASIN', 'QuantityOrdered', 'QuantityShipped')
@@ -168,3 +207,61 @@ class SPAPIClient:
                           {}, 'ItemData', next_path='/fba/inbound/v0/shipmentItems', query_type=True)
         keys = ('ShipmentId', 'SellerSKU', 'QuantityShipped', 'QuantityReceived')
         return [{key: row.get(key) for key in keys} for row in raw]
+
+    def _orders_2026(self, created_after, created_before):
+        # 2026 includes complete orderItems in searchOrders; request only the
+        # fulfillment/cancellation datasets, never BUYER or RECIPIENT.
+        self._order_items = {}
+        params = {'marketplaceIds': self.marketplace, 'createdAfter': created_after,
+                  'createdBefore': created_before, 'fulfilledBy': 'AMAZON',
+                  'maxResultsPerPage': 100, 'includedData': 'FULFILLMENT,CANCELLATION'}
+        orders, items_by_order, seen = [], {}, set()
+        while True:
+            data = self.get('/orders/2026-01-01/orders', dict(params))
+            if not isinstance(data.get('orders'), list):
+                raise SPAPIError('Missing orders in 2026 response')
+            for row in data['orders']:
+                if not isinstance(row, dict) or not isinstance(row.get('orderItems'), list):
+                    raise SPAPIError('Missing order items in 2026 response')
+                fulfillment = row.get('fulfillment') or {}
+                channel = row.get('salesChannel') or {}
+                if not isinstance(fulfillment, dict) or not isinstance(channel, dict):
+                    raise SPAPIError('Malformed 2026 order structure')
+                status = fulfillment.get('fulfillmentStatus')
+                statuses = {'CANCELLED': 'Canceled', 'PENDING_AVAILABILITY': 'PendingAvailability',
+                            'PENDING': 'Pending', 'UNSHIPPED': 'Unshipped',
+                            'PARTIALLY_SHIPPED': 'PartiallyShipped', 'SHIPPED': 'Shipped',
+                            'UNFULFILLABLE': 'Unfulfillable'}
+                order_id = row.get('orderId')
+                if not isinstance(order_id, str) or not order_id or order_id in items_by_order:
+                    raise SPAPIError('Missing or duplicate 2026 order identity')
+                orders.append({'AmazonOrderId': order_id, 'PurchaseDate': row.get('createdTime'),
+                               'OrderStatus': statuses.get(status),
+                               'FulfillmentChannel': 'AFN' if fulfillment.get('fulfilledBy') == 'AMAZON' else 'MFN',
+                               'MarketplaceId': channel.get('marketplaceId')})
+                items = []
+                for item in row['orderItems']:
+                    if not isinstance(item, dict):
+                        raise SPAPIError('Malformed 2026 order item')
+                    product = item.get('product') or {}
+                    cancellation = item.get('cancellation') or {}
+                    item_fulfillment = item.get('fulfillment') or {}
+                    if not all(isinstance(value, dict) for value in (product, cancellation, item_fulfillment)):
+                        raise SPAPIError('Malformed 2026 item datasets')
+                    cancelled = cancellation.get('cancellationExecution')
+                    items.append({'OrderItemId': item.get('orderItemId'), 'SellerSKU': product.get('sellerSku'),
+                                  'ASIN': product.get('asin'),
+                                  'QuantityOrdered': 0 if cancelled else item.get('quantityOrdered'),
+                                  'QuantityShipped': item_fulfillment.get('quantityFulfilled')})
+                items_by_order[order_id] = items
+            pagination = data.get('pagination') or {}
+            if not isinstance(pagination, dict):
+                raise SPAPIError('Malformed 2026 pagination')
+            token = pagination.get('nextToken')
+            if not token:
+                self._order_items = items_by_order
+                return orders
+            if not isinstance(token, str) or token in seen:
+                raise SPAPIError('Invalid or repeated pagination token')
+            seen.add(token)
+            params['paginationToken'] = token
