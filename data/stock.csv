@@ -1,0 +1,5 @@
+sku,fulfillable,reserved,unfulfillable
+J001-size 5,30,2,0
+J001-size 6,20,1,0
+J001-size 7,10,0,0
+J002-size 5,40,3,1
