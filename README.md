@@ -16,6 +16,12 @@ workbook and SELECT-only simulation. See [第一批 SKU 审核说明](docs/FIRST
 Preparing or simulating this workbook never imports mappings; a later explicit user
 confirmation is required for any formal configuration import.
 
+Independent SKU acceptance is an opt-in mode via `sku-sync-plan` and `sku-plan`.
+It reuses the resumable 90-day collectors, keeps the original family configuration
+in its source database, and calculates SKU scenarios without family approval or
+family stop inheritance. Explicit SKU stops remain effective. See
+[单 SKU 独立统计、恢复与试算参数](docs/INDEPENDENT_SKU.zh-CN.md).
+
 ## Install and test
 
 ```bash

@@ -90,12 +90,57 @@ def main():
     simulation.add_argument('xlsx')
     simulation.add_argument('--source', default='output/batch-review/sku_batch_review.xlsx', help='Independent original review workbook binding the first cohort snapshot')
     simulation.add_argument('--output', help='Optional safe JSON simulation report')
+    sku_sync = commands.add_parser('sku-sync-plan', help='Precheck and resumably collect 90-day US FBA data for independent SKU scenarios')
+    sku_sync.add_argument('--confirm-read-only', action='store_true')
+    sku_sync.add_argument('--source-db', default='output/sku-review/review.db', help='Copy existing human mappings/stops into a separate store once')
+    sku_sync.add_argument('--output-dir', default='output/sku-independent-90d')
+    sku_sync.add_argument('--timezone', default=os.environ.get('SP_API_TIMEZONE','America/Los_Angeles'))
+    sku_sync.add_argument('--precheck-only', action='store_true')
+    sku_sync.add_argument('--shard-days', type=int, default=7)
+    sku_sync.add_argument('--force', action='store_true', help='Refresh historical sales and inbound caches')
+    sku_local = commands.add_parser('sku-plan', help='Recalculate independent SKU scenarios from previously collected local data')
+    sku_local.add_argument('--source-db', default='output/sku-review/review.db', help='Observe current effective original SKU stops without importing or resuming')
+    sku_local.add_argument('--output', default='output/sku-independent-90d/sku_replenishment_90d.xlsx')
+    for command in (sku_sync,sku_local):
+        command.add_argument('--asof', help='Last completed US business date')
+        for name, default in [('lead-days',35),('target-days',75),('safety-days',0),('moq',1),('case-pack',1),('max-stock-age-days',2)]:
+            command.add_argument('--'+name,type=int,default=default)
+        command.add_argument('--inbound-rule', choices=['confirmed_eta','exclude'], default='confirmed_eta')
+        command.add_argument('--parameters-confirmed', action='store_true', help='Use only after the human has explicitly confirmed all scenario parameters')
     plan = commands.add_parser('plan')
     for name, default in [('lead-days', 35), ('target-days', 75), ('safety-days', 0), ('moq', 1), ('case-pack', 1), ('max-stock-age-days', 2)]:
         plan.add_argument('--' + name, type=int, default=default)
     plan.add_argument('--asof', help='Last complete sales day; default previous day in synced sales timezone (UTC for CSV)')
     plan.add_argument('--output', default='output/replenishment.xlsx')
     args = parser.parse_args()
+    if args.command in ('sku-sync-plan','sku-plan'):
+        from .sku_runner import SafeCountSession, run_sku_collection, apply_latest_source_stops
+        from .sku_plan import calculate_skus
+        from .sku_export import export_sku_report
+        if args.marketplace!='US':
+            parser.error('Independent SKU acceptance currently supports the US namespace only')
+        settings={key:getattr(args,key) for key in ('lead_days','target_days','safety_days','moq','case_pack','max_stock_age_days','inbound_rule','parameters_confirmed')}
+        db=args.db or 'output/sku-independent-90d/sku_plan.db'
+        def progress(value):print(json.dumps(value,ensure_ascii=False),flush=True)
+        try:
+            if args.command=='sku-sync-plan':
+                if not args.confirm_read_only:
+                    parser.error('Live independent SKU collection requires --confirm-read-only')
+                result=run_sku_collection(SPAPIClient(session=SafeCountSession(progress),allow_live=True),
+                        db,args.output_dir,source_path=args.source_db,asof=args.asof,
+                        timezone_name=args.timezone,shard_days=args.shard_days,force=args.force,
+                        precheck_only=args.precheck_only,settings=settings,progress=progress)
+            else:
+                from .first_batch import readonly_database
+                with readonly_database(db) as sku_con:
+                    rows=apply_latest_source_stops(calculate_skus(sku_con,asof=args.asof,marketplace='US',**settings),args.source_db)
+                    result=export_sku_report(rows,args.output,sku_con,'US',settings)
+            progress(result)
+        except SPAPIError as error:
+            parser.exit(1,'Independent SKU operation failed: '+error.code+'; inspect safe failure.json and resume checkpoints.\n')
+        except (ValueError,KeyError,TypeError,OSError):
+            parser.exit(1,'Independent SKU operation failed local validation; inspect inputs and preserved safe collection audit.\n')
+        return
     if args.command == 'diagnose-spapi':
         report = diagnose(mock=args.mock, live=args.live, confirm_read_only=args.confirm_read_only)
         print(json.dumps(report, indent=2, ensure_ascii=False))
