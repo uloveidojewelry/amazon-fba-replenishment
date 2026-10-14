@@ -83,6 +83,13 @@ def main():
     stops = commands.add_parser('import-stop-list', help='Import APPROVED TRUE stops locally; false never resumes a SKU')
     stops.add_argument('file')
     stops.add_argument('--reviewer', required=True)
+    first = commands.add_parser('prepare-first-review', help='Read-only extraction of the first exact-reference cohort; every decision defaults NEEDS_REVIEW')
+    first.add_argument('--source', default='output/batch-review/sku_batch_review.xlsx')
+    first.add_argument('--output-dir', default='output/first-batch-review')
+    simulation = commands.add_parser('simulate-first-review', help='SELECT-only validation of edited APPROVE/REJECT/NEEDS_REVIEW decisions; no import permission')
+    simulation.add_argument('xlsx')
+    simulation.add_argument('--source', default='output/batch-review/sku_batch_review.xlsx', help='Independent original review workbook binding the first cohort snapshot')
+    simulation.add_argument('--output', help='Optional safe JSON simulation report')
     plan = commands.add_parser('plan')
     for name, default in [('lead-days', 35), ('target-days', 75), ('safety-days', 0), ('moq', 1), ('case-pack', 1), ('max-stock-age-days', 2)]:
         plan.add_argument('--' + name, type=int, default=default)
@@ -99,9 +106,28 @@ def main():
         parser.error('Real SKU review requires --confirm-read-only')
     if args.command == 'sync' and not args.mock and not args.confirm_read_only:
         parser.error('Live sync requires --confirm-read-only; use --mock for offline data')
-    batch_commands = ('prepare-batch-review','create-review-scope','approve-batch','import-batch-review','import-stop-list')
+    batch_commands = ('prepare-batch-review','create-review-scope','approve-batch','import-batch-review','import-stop-list','prepare-first-review','simulate-first-review')
     db = args.db or ('output/sku-review/review.db' if args.command in ('review-skus', 'discover-skus')+batch_commands else
                     'output/mock-fba.db' if args.command == 'sync' and args.mock else 'data/fba.db')
+    if args.command in ('prepare-first-review','simulate-first-review'):
+        # Bypass connect(): even harmless schema migrations are inappropriate
+        # during a strictly read-only preparation or simulation.
+        from .first_batch import prepare_first_batch, simulate_first_batch_file
+        try:
+            if args.command=='prepare-first-review':
+                result=prepare_first_batch(args.source,db,args.output_dir,args.marketplace)
+            else:
+                result=simulate_first_batch_file(args.xlsx,db,args.source)
+                if args.output:
+                    Path(args.output).parent.mkdir(parents=True,exist_ok=True)
+                    Path(args.output).write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding='utf-8')
+                    result={key:result.get(key) for key in ('mode','status','structure_status','decision_status',
+                            'requires_explicit_user_confirmation','import_permitted','global_blockers','summary')}
+                    result['report_path']=args.output
+            print(json.dumps(result,indent=2,ensure_ascii=False))
+        except (ValueError,OSError,KeyError,TypeError):
+            parser.exit(1,'First review validation failed; preserve the source workbook and frozen member identifiers. No mapping was imported.\n')
+        return
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     con = connect(db)
     try:

@@ -11,6 +11,11 @@ or rejection, confirmed stop-list imports and immutable before/after audits. See
 [SKU 系列批量审核与导入](docs/SKU_BATCH_REVIEW.zh-CN.md). Preparing a queue is offline;
 exact reference matches and naming candidates remain unapproved.
 
+The first exact-reference cohort has a separate `APPROVE / REJECT / NEEDS_REVIEW`
+workbook and SELECT-only simulation. See [第一批 SKU 审核说明](docs/FIRST_BATCH_REVIEW.zh-CN.md).
+Preparing or simulating this workbook never imports mappings; a later explicit user
+confirmation is required for any formal configuration import.
+
 ## Install and test
 
 ```bash
