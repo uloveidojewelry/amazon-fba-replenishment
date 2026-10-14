@@ -474,6 +474,7 @@ def export_sku_report(rows, path, con, marketplace, settings, collection_audit=N
                   {'parameter': 'parameter_status', 'value': summary['parameter_status']},
                   {'parameter': 'warning', 'value': '参数未确认时仅为试算，不得作为正式采购依据；所有建议仅供人工审核。'},
                   {'parameter': 'sales_basis_days', 'value': 30},
+                  {'parameter': 'sales_scope', 'value': '美国站FBA/AFN订单件数；取消订单排除。本次未采集MFN订单，不扣除退货或退款净额。'},
                   {'parameter': 'family_mapping_required', 'value': False},
                   {'parameter': 'family_stop_applied', 'value': False},
                   {'parameter': 'direct_sku_stop_applied', 'value': True},
