@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS order_line (
  marketplace TEXT NOT NULL, order_id TEXT NOT NULL, item_id TEXT NOT NULL,
  sku TEXT NOT NULL, day TEXT NOT NULL, status TEXT NOT NULL, units INTEGER NOT NULL,
  PRIMARY KEY(marketplace,order_id,item_id));
+CREATE TABLE IF NOT EXISTS data_quality_block (
+ marketplace TEXT NOT NULL, sku TEXT NOT NULL, code TEXT NOT NULL,
+ reason TEXT NOT NULL, PRIMARY KEY(marketplace,sku,code));
 """
 ACTIVE_INBOUND = ('SHIPPED', 'IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING')
 
@@ -205,7 +208,10 @@ def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0
         sku, family = mapped['sku'], mapped['family']
         stock = con.execute('SELECT * FROM stock WHERE marketplace=? AND sku=?', (marketplace, sku)).fetchone()
         sales = con.execute('SELECT SUM(units) n,COUNT(*) days FROM sales WHERE marketplace=? AND sku=? AND day>=? AND day<=?', (marketplace, sku, start, end)).fetchone()
-        daily = (sales['n'] or 0) / 30
+        complete_sales = sales['days'] == 30
+        daily = sales['n'] / 30 if complete_sales else None
+        quality = con.execute('SELECT code,reason FROM data_quality_block WHERE marketplace=? AND sku=? ORDER BY code',
+                              (marketplace, sku)).fetchall()
         incoming = list(con.execute('SELECT * FROM inbound WHERE marketplace=? AND sku=?', (marketplace, sku)))
         eligible = sum(r['units'] for r in incoming if r['status'] in ACTIVE_INBOUND and r['eta'] and r['eta'] <= due)
         unknown_eta = sum(r['units'] for r in incoming if r['status'] in ACTIVE_INBOUND and not r['eta'])
@@ -215,10 +221,13 @@ def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0
             # Historical asof does not make an old current snapshot fresh.
             age = max(0, (max(asof, datetime.now(timezone.utc).date()) - observed).days)
         status, reason, qty = 'ACTIVE', '', 0
-        if sku in direct_stops or family in stop_families or not mapped['enabled']:
+        if (sku in direct_stops or family in stop_families or not mapped['enabled']
+                or any(r['code'] == 'DISCOVERY_FAMILY_STOPPED' for r in quality)):
             status, reason = 'STOPPED', 'Manual/family stop: ' + ', '.join(stop_families.get(family, [sku]))
         elif not family:
             status, reason = 'FAMILY_REVIEW_REQUIRED', 'No confirmed family mapping'
+        elif quality:
+            status, reason = 'DATA_REVIEW_REQUIRED', '; '.join(r['code'] + ': ' + r['reason'] for r in quality)
         elif failed_sources:
             status, reason = 'SYNC_FAILED', 'Latest collection failed: ' + ', '.join(failed_sources)
         elif stock is None:
@@ -234,14 +243,14 @@ def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0
             qty = math.ceil(max(raw, moq) / case_pack) * case_pack if raw else 0
         rows.append({
             'marketplace': marketplace, 'sku': sku, 'family': family or '', 'asin': mapped['asin'] or '',
-            'sales_30d': sales['n'] if sales['days'] else None, 'observed_sales_days': sales['days'],
-            'daily_sales': round(daily, 3) if sales['days'] else None,
+            'sales_30d': sales['n'] if complete_sales else None, 'observed_sales_days': sales['days'],
+            'daily_sales': round(daily, 3) if daily is not None else None,
             'fulfillable': stock['fulfillable'] if stock else None,
             'reserved': stock['reserved'] if stock else None,
             'unfulfillable': stock['unfulfillable'] if stock else None,
             'stock_observed_at': stock['observed_at'] if stock else None, 'stock_age_days': age,
             'eligible_inbound': eligible, 'unknown_eta_inbound': unknown_eta,
-            'coverage_days': round(stock['fulfillable'] / daily, 1) if stock and daily > 0 else None,
+            'coverage_days': round(stock['fulfillable'] / daily, 1) if stock and daily is not None and daily > 0 else None,
             'status': status, 'stop_reason': reason, 'recommended_qty': qty, 'asof': end,
             'window_start': start, 'lead_days': lead_days, 'target_days': target_days,
             'safety_days': safety_days, 'moq': moq, 'case_pack': case_pack, 'sales_timezone': sales_timezone,

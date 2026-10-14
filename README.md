@@ -2,6 +2,10 @@
 
 Python 3.10+ / SQLite / requests / openpyxl. No shipment, listing, purchase-order or other Amazon business write operation exists. Only LWA token exchange uses POST; business collection is allowlisted GET. Live requests require explicit `--confirm-read-only`; the default diagnostic and mock mode are offline.
 
+Auto SKU Discovery V1.0 persists marketplace/SellerSKU identity and history, separates
+candidate and approved mappings, inherits family stops and produces review workbooks.
+See [自动 SKU 发现与每日运行](docs/AUTO_SKU_DISCOVERY.zh-CN.md).
+
 ## Install and test
 
 ```bash
@@ -81,7 +85,7 @@ Enable the seller-authorized SP-API app with **Inventory and Order Tracking** (O
 
 Allow HTTPS to `api.amazon.com` and the selected regional host (`sellingpartnerapi-na.amazon.com`, `sellingpartnerapi-eu.amazon.com`, or `sellingpartnerapi-fe.amazon.com`). Keep existing package/GitHub network presets. No inbound service port is needed.
 
-**Not yet implemented / verified:** Reports API request/poll/download adapters (report creation uses POST and requires separately agreed read-data scope), Sales v1 metrics, Fulfillment Inbound 2024 plan/delivery-window adapters, carrier ETA, refunds/net-sales reports, scheduler, seasonality, time-phased forecast and production approval identity enforcement. No real API validation has occurred without credentials. Offline tests cover official-model response structures but do not prove seller authorization, production data completeness, platform proxy substitution or live API compatibility. Review all procurement decisions manually.
+**Not yet implemented / verified:** Reports API request/poll/download adapters (report creation uses POST and requires separately agreed read-data scope), Sales v1 metrics, Fulfillment Inbound 2024 plan/delivery-window adapters, carrier ETA, refunds/net-sales reports, hosted daily scheduling, seasonality, time-phased forecast and production approval identity enforcement. LWA, Orders, FBA Inventory and Inbound v0 real read-only smoke tests passed. Current FBA inventory was fully collected; 90-day sales remain paused pending mapping review. Catalog relationships and Inbound 2024 plan probes returned 403. Review all procurement decisions manually.
 
 Official models checked during development:
 - https://github.com/amzn/selling-partner-api-models/blob/main/models/orders-api-model/ordersV0.json

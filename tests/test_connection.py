@@ -262,9 +262,15 @@ def test_orders_2026_sync_with_real_adapter_fake_transport_preserves_family_stop
                         [('US', sku, sku.split('-')[0]) for sku in skus])
     from fba_replenishment.core import stop
     stop(con, 'US', skus[0], 'Stopped')
-    inventory = [{'sellerSku': sku, 'fnSku': 'test-'+sku, 'condition': 'NewItem',
+    inventory = [{'sellerSku': sku, 'asin': 'B'+str(index).zfill(9), 'fnSku': 'test-'+sku, 'condition': 'NewItem',
                   'inventoryDetails': {'fulfillableQuantity': 1, 'reservedQuantity': {'totalReservedQuantity': 0},
-                                       'unfulfillableQuantity': {'totalUnfulfillableQuantity': 0}}} for sku in skus]
+                                       'unfulfillableQuantity': {'totalUnfulfillableQuantity': 0},
+                                       'inboundWorkingQuantity': 0, 'inboundShippedQuantity': 0,
+                                       'inboundReceivingQuantity': 0}} for index, sku in enumerate(skus)]
+    from fba_replenishment.discovery import discover, approve_mapping
+    discover(con, inventory, 'US', 'ATVPDKIKX0DER')
+    for sku in skus:
+        approve_mapping(con, 'US', sku, sku.split('-')[0], 'Test manager')
     raw = order()
     raw['createdTime'] = day.isoformat()+'T12:00:00Z'
     raw['orderItems'][0]['product']['sellerSku'] = skus[2]
