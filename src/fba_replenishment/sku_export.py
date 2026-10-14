@@ -7,8 +7,10 @@ response merely because a sync was marked successful.
 from collections.abc import Mapping
 from datetime import datetime
 import math
+import os
 from pathlib import Path
 import re
+import tempfile
 
 from openpyxl import Workbook
 from openpyxl.comments import Comment
@@ -378,6 +380,21 @@ def _report_sheet(wb, name, columns, rows):
     return ws
 
 
+def _save_atomically(wb, output):
+    """Publish only a completely serialized workbook on the same filesystem."""
+    descriptor, name = tempfile.mkstemp(
+        prefix='.' + output.name + '.', suffix='.xlsx', dir=output.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        wb.save(temporary)
+        with temporary.open('rb') as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def export_sku_report(rows, path, con, marketplace, settings, collection_audit=None):
     """Export exactly the supplied SKU cohort without importing or changing data.
 
@@ -479,5 +496,5 @@ def export_sku_report(rows, path, con, marketplace, settings, collection_audit=N
     statistics.column_dimensions['B'].width = 100
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output)
+    _save_atomically(wb, output)
     return summary

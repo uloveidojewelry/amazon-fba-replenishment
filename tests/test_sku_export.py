@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 import sqlite3
 
 from openpyxl import load_workbook
@@ -6,6 +7,7 @@ import pytest
 
 from fba_replenishment.core import connect
 from fba_replenishment.review import REVIEW_SCHEMA
+from fba_replenishment import sku_export
 from fba_replenishment.sku_export import export_sku_report
 
 
@@ -407,3 +409,67 @@ def test_multiple_fnsku_exceptions_keep_all_evidence_but_count_one_unknown_sku(t
     assert summary['inbound_exception_line_count'] == 2
     assert len(read_rows(wb['数据异常'])) == 1
     con.close()
+
+
+def test_partial_serialization_failure_preserves_previous_excel_and_cleans_temporary(tmp_path, monkeypatch):
+    export_rows(tmp_path, [plan('previous')])
+    output = tmp_path / 'report.xlsx'
+    original = output.read_bytes()
+    destinations = []
+
+    def partial_save(wb, destination):
+        temporary = Path(destination)
+        destinations.append(temporary)
+        assert temporary != output
+        assert temporary.parent == output.parent
+        temporary.write_bytes(b'PARTIAL_XLSX_ARCHIVE')
+        raise OSError('Simulated disk write failure')
+
+    monkeypatch.setattr(sku_export.Workbook, 'save', partial_save)
+    with pytest.raises(OSError, match='Simulated disk write failure'):
+        export_sku_report([plan('new')], output, None, 'US', {})
+    assert output.read_bytes() == original
+    assert [r['sku'] for r in read_rows(load_workbook(output)['SKU补货总表'])] == ['previous']
+    assert len(destinations) == 1
+    assert not destinations[0].exists()
+    assert set(tmp_path.iterdir()) == {output}
+
+
+def test_atomic_save_success_replaces_previous_excel_only_after_serialization(tmp_path, monkeypatch):
+    export_rows(tmp_path, [plan('previous')])
+    output = tmp_path / 'report.xlsx'
+    original = output.read_bytes()
+    replacement = sku_export.os.replace
+    replacements = []
+
+    def checked_replace(source, destination):
+        source, destination = Path(source), Path(destination)
+        assert source.parent == destination.parent == tmp_path
+        assert output.read_bytes() == original
+        assert [r['sku'] for r in read_rows(load_workbook(source)['SKU补货总表'])] == ['new']
+        replacements.append((source, destination))
+        replacement(source, destination)
+
+    monkeypatch.setattr(sku_export.os, 'replace', checked_replace)
+    summary = export_sku_report([plan('new')], output, None, 'US', {})
+    assert len(replacements) == 1
+    assert summary['excel_path'] == str(output)
+    assert output.read_bytes() != original
+    assert [r['sku'] for r in read_rows(load_workbook(output)['SKU补货总表'])] == ['new']
+    assert set(tmp_path.iterdir()) == {output}
+
+
+def test_replace_failure_preserves_previous_excel_and_cleans_fully_serialized_temp(tmp_path, monkeypatch):
+    export_rows(tmp_path, [plan('previous')])
+    output = tmp_path / 'report.xlsx'
+    original = output.read_bytes()
+
+    def failed_replace(source, destination):
+        assert Path(source).exists()
+        raise OSError('Simulated rename failure')
+
+    monkeypatch.setattr(sku_export.os, 'replace', failed_replace)
+    with pytest.raises(OSError, match='Simulated rename failure'):
+        export_sku_report([plan('new')], output, None, 'US', {})
+    assert output.read_bytes() == original
+    assert set(tmp_path.iterdir()) == {output}
