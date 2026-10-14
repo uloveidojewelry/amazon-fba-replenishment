@@ -470,7 +470,7 @@ def _sanitize_shipments(rows):
     return clean
 
 
-def _sanitize_shipment_items(shipment_id, rows):
+def _sanitize_shipment_items(shipment_id, rows, allow_quantity_exceptions=False):
     clean, seen = [], {}
     for row in rows:
         if not isinstance(row, dict):
@@ -481,7 +481,7 @@ def _sanitize_shipment_items(shipment_id, rows):
         sku = _text(item['SellerSKU'], 'MISSING_SHIPMENT_ITEM_SKU')
         shipped = _quantity(item['QuantityShipped'], 'MISSING_SHIPMENT_SHIPPED_QUANTITY')
         received = _quantity(item['QuantityReceived'], 'MISSING_SHIPMENT_RECEIVED_QUANTITY')
-        if received > shipped:
+        if received > shipped and not allow_quantity_exceptions:
             raise CollectionQualityError('RECEIVED_EXCEEDS_SHIPPED_QUANTITY')
         identity = (sku, item['FulfillmentNetworkSKU'])
         if identity in seen:
@@ -494,16 +494,21 @@ def _sanitize_shipment_items(shipment_id, rows):
 
 
 def collect_inbound_snapshot(client, cache_dir, force=False, ttl_hours=1,
-                             include_terminal_items=False):
+                             include_terminal_items=False, allow_quantity_exceptions=False):
     """Collect current shipment identities plus active/working lines, read-only.
 
     Terminal shipment lines are unnecessary for in-transit quantities and are
     omitted by default; their statuses remain in the shipment audit.
+    Opt-in SKU isolation retains received>shipped as original quantities, never
+    as a fabricated zero balance. The default strict mode remains unchanged.
     """
     if ttl_hours <= 0:
         raise ValueError('Positive ttl_hours is required')
     path, binding = _snapshot_path(client, cache_dir, 'inbound')
     binding = dict(binding, include_terminal_items=include_terminal_items)
+    if allow_quantity_exceptions:
+        path = path.with_name('inbound_sku_exceptions.json')
+        binding = dict(binding, allow_quantity_exceptions=True)
     checkpoint = _read_snapshot(path, binding, force, ttl_hours)
     active = {'WORKING', 'SHIPPED', 'RECEIVING', 'IN_TRANSIT', 'DELIVERED', 'CHECKED_IN'}
     if checkpoint is None:
@@ -513,7 +518,9 @@ def collect_inbound_snapshot(client, cache_dir, force=False, ttl_hours=1,
             identity = shipment['ShipmentId']
             rows = (client.shipment_items(identity)
                     if include_terminal_items or shipment['ShipmentStatus'] in active else [])
-            items[identity] = _sanitize_shipment_items(identity, rows)
+            items[identity] = _sanitize_shipment_items(identity, rows, allow_quantity_exceptions)
+            if not items[identity] and shipment['ShipmentStatus'] in active - {'WORKING'}:
+                raise CollectionQualityError('INBOUND_ITEMS_INCOMPLETE')
         observed_at = datetime.now(timezone.utc).isoformat()
         _write_checkpoint(path, {'format': 2, 'binding': binding, 'complete': True,
                                 'collected_at': observed_at,
@@ -543,12 +550,21 @@ def collect_inbound_snapshot(client, cache_dir, force=False, ttl_hours=1,
             identity = shipment['ShipmentId']
             if not isinstance(raw_items.get(identity), list):
                 raise CollectionQualityError('INVALID_COLLECTION_CHECKPOINT')
-            items[identity] = _sanitize_shipment_items(identity, raw_items[identity])
+            items[identity] = _sanitize_shipment_items(identity, raw_items[identity], allow_quantity_exceptions)
+            if not items[identity] and shipment['ShipmentStatus'] in active - {'WORKING'}:
+                raise CollectionQualityError('INBOUND_ITEMS_INCOMPLETE')
         source = 'checkpoint'
         observed_at = checkpoint['collected_at']
+    exceptions = [row for rows in items.values() for row in rows
+                  if row['QuantityReceived'] > row['QuantityShipped']]
     audit = {'shipments': len(shipments), 'shipment_items': sum(map(len, items.values())),
              'statuses': dict(Counter(row['ShipmentStatus'] for row in shipments)),
              'source': source, 'complete': True, 'observed_at': observed_at,
              'terminal_items_collected': include_terminal_items,
+             'allow_quantity_exceptions': allow_quantity_exceptions,
+             'quantity_exception_rows': len(exceptions),
+             'quantity_exception_sku_count': len({row['SellerSKU'] for row in exceptions}),
+             'quantity_exceptions': {'RECEIVED_EXCEEDS_SHIPPED_QUANTITY': len(exceptions)} if exceptions else {},
+             'quantity_status': 'SUCCESS_WITH_SKU_EXCEPTIONS' if exceptions else 'SUCCESS',
              'eta_source': 'manual_only; API arrival/need-by dates are not verified ETA'}
     return shipments, items, audit

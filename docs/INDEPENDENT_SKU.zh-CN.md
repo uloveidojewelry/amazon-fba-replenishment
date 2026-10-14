@@ -21,6 +21,7 @@ fba-plan sku-sync-plan --confirm-read-only
 采集顺序是完整 FBA 库存、小样本订单和入仓读取预检查、90 天订单分片、入仓货件、
 本地原子核对及 Excel 输出。预检查硬错误阻止扩量。最近 90 个完整美国业务日按
 `America/Los_Angeles` 划分，截止日前一天；不将未完成的当天当成完整一天。
+订单采集较慢时，在计算前再次验证库存缓存新鲜度，过期则重采全部库存。
 
 沿用已验证的 Orders 2026-01-01 和 Fulfillment Inbound v0。当前销量口径为
 FBA/AFN 的订单件数，取消订单排除；未采集 MFN 自配送、退款退货净销量。
@@ -69,6 +70,12 @@ FC 转运和处理；不可售取 `totalUnfulfillableQuantity`。预留和不可
 且未确认抵达的 ETA 拦截。Amazon need-by/arrival 字段不冒充人工确认 ETA。
 `exclude` 明确不抵扣在途，未知 ETA 仍列为异常，但单独未知 ETA 不拦截该场景；
 数量、状态和摘要对账异常仍拦截。此规则改变需作为试算参数公开显示。
+
+独立模式遇到已接收大于已发运且能定位 SKU 的记录时，保留两项原数量，
+将该 SKU 的全部在途余额标为 UNKNOWN 并拦截建议，不把负差额截成零。
+异常明细另存 `sku_inbound_exception` 并在 Excel 展示。其他 SKU 可以独立认证；
+缺 SKU、活动货件缺行或非法数量等无法安全定位的问题仍阻止整份认证。
+旧系列模式的严格拒绝规则保持不变。
 
 ## Excel 和完整率
 

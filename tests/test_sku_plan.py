@@ -146,10 +146,9 @@ def test_other_non_success_sales_status_blocks_all_skus(data, status):
                and row['recommended_qty'] is None for row in rows.values())
 
 
-@pytest.mark.parametrize('source', ['stock', 'inbound'])
-def test_sales_exception_status_is_not_success_for_other_sources(data, source):
+def test_sku_exception_status_is_not_success_for_inventory_source(data):
     con, _ = data
-    con.execute('UPDATE sync_log SET status=? WHERE kind=?', ('SUCCESS_WITH_SKU_EXCEPTIONS', source))
+    con.execute('UPDATE sync_log SET status=? WHERE kind=?', ('SUCCESS_WITH_SKU_EXCEPTIONS', 'stock'))
     con.commit()
     assert all(row['recommended_qty'] is None for row in planned(data).values())
 
@@ -405,3 +404,49 @@ def test_persisted_source_quality_blocks_invalidate_completeness(data, code, fie
     con.commit()
     row = planned(data)['a']
     assert row[field] is False and row['data_complete'] is False and row['recommended_qty'] is None
+
+
+def test_completed_inbound_with_sku_quantity_exception_only_blocks_affected_sku(data):
+    con, _ = data
+    con.execute("UPDATE sync_log SET status='SUCCESS_WITH_SKU_EXCEPTIONS' WHERE kind='inbound'")
+    con.execute("INSERT INTO data_quality_block VALUES('US','a','INBOUND_QUANTITY_CONFLICT','Received exceeds shipped; remaining is unknown')")
+    con.commit()
+    rows = planned(data)
+    assert rows['a']['inbound_complete'] is False and rows['a']['recommended_qty'] is None
+    assert rows['a']['eligible_inbound'] is None and rows['a']['unknown_eta_inbound'] is None
+    assert rows['a']['shipment_active_inbound'] is None
+    assert rows['b']['inbound_complete'] is True and rows['b']['eligible_inbound'] == 0
+    assert rows['b']['recommended_qty'] == 105 and rows['b']['status'] == 'SCENARIO_ONLY'
+
+
+@pytest.mark.parametrize('status', ['PARTIAL', 'FAILED', 'INCOMPLETE', 'UNKNOWN'])
+def test_other_non_success_inbound_status_blocks_all_skus(data, status):
+    con, _ = data
+    con.execute("UPDATE sync_log SET status=? WHERE kind='inbound'", (status,))
+    con.commit()
+    rows = planned(data)
+    assert all(row['inbound_complete'] is False and row['eligible_inbound'] is None
+               and row['unknown_eta_inbound'] is None and row['recommended_qty'] is None
+               for row in rows.values())
+
+
+def test_exact_33_unit_30_day_demand_does_not_round_float_noise_up(data):
+    con, end = data
+    con.execute("UPDATE stock SET fulfillable=0 WHERE marketplace='US' AND sku='a'")
+    con.execute('UPDATE sales SET units=4 WHERE marketplace=? AND sku=? AND day=?',
+                ('US', 'a', end.isoformat()))
+    con.commit()
+    row = planned(data)['a']
+    assert row['sales_30d'] == 33
+    # Independent fixed oracle: 33 / 30 = 1.1; 110 days require exactly 121.
+    assert row['recommended_qty'] == 121
+
+
+def test_fractional_day_parameters_are_exact_before_rounding(data):
+    con, end = data
+    con.execute("UPDATE stock SET fulfillable=0 WHERE marketplace='US' AND sku='a'")
+    con.execute('UPDATE sales SET units=4 WHERE marketplace=? AND sku=? AND day=?',
+                ('US', 'a', end.isoformat()))
+    con.commit()
+    row = planned(data, lead_days=0.1, target_days=109.9)['a']
+    assert row['sales_30d'] == 33 and row['recommended_qty'] == 121

@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from .collection import CollectionQualityError, collect_sales_shards, collect_inbound_snapshot
+from .collection import CollectionQualityError, collect_sales_shards, collect_inventory_snapshot
 from .config import US_MARKETPLACE
 from .core import connect, log_sync
 from .mock import is_mock_database
@@ -186,7 +186,7 @@ def _save(path, value):
 def run_sku_collection(client, database_path, output_dir, *, source_path=None,
                        asof=None, timezone_name='America/Los_Angeles', shard_days=7,
                        force=False, precheck_only=False, settings=None, progress=None):
-    from .sku_collection import precheck_sku, reconcile_sku_data
+    from .sku_collection import precheck_sku, reconcile_sku_data, collect_sku_inbound_snapshot
     from .sku_plan import calculate_skus
     from .sku_export import export_sku_report
 
@@ -236,9 +236,15 @@ def run_sku_collection(client, database_path, output_dir, *, source_path=None,
         audits.extend(dict(stage='SALES_DATE_SHARD', **row) for row in sales.audit)
         emit('SALES_COLLECTED', orders=sales.order_count, order_items=sales.item_count,
              completed_shards=len(sales.audit), issues=sales.issues)
+        # A slow Orders usage plan can take hours. Reuse only a fresh inventory
+        # checkpoint at calculation time, rather than the precheck's old stock.
+        stage = 'INVENTORY_REFRESH'
+        emit(stage)
+        inventory,inventory_audit=collect_inventory_snapshot(client,dest/'checkpoints',force=force)
+        _save(dest/'inventory_final_audit.json',inventory_audit)
         stage = 'INBOUND'
         emit(stage)
-        shipments, shipment_items, inbound_audit = collect_inbound_snapshot(
+        shipments, shipment_items, inbound_audit = collect_sku_inbound_snapshot(
             client, dest/'checkpoints', force=force)
         _save(dest/'inbound_audit.json', inbound_audit)
         audits.extend([dict(stage='INVENTORY', **inventory_audit), dict(stage=stage, **inbound_audit)])

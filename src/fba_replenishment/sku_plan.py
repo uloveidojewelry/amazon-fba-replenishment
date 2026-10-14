@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 import json
 import math
+from fractions import Fraction
 from zoneinfo import ZoneInfo
 
 from .core import ACTIVE_INBOUND
@@ -19,7 +20,7 @@ IGNORED_FAMILY_BLOCKS = frozenset({
     'MAPPING_UNAPPROVED', 'DISCOVERY_MAPPING_UNAPPROVED',
     'DISCOVERY_FAMILY_CONFLICT', 'DISCOVERY_FAMILY_STOPPED', 'SCHEDULED_STOP_SCOPE_CONFLICT',
 })
-COMPLETE_SALES_COLLECTION = frozenset({'SUCCESS', 'SUCCESS_WITH_SKU_EXCEPTIONS'})
+COMPLETE_SKU_COLLECTION = frozenset({'SUCCESS', 'SUCCESS_WITH_SKU_EXCEPTIONS'})
 
 
 def _table_names(con):
@@ -151,7 +152,7 @@ def calculate_skus(con, marketplace='US', asof=None, lead_days=35, target_days=7
             except (ValueError, TypeError, KeyError):
                 issue('SKU_IDENTITY_UNKNOWN', 'Stored inventory SKU identity evidence is invalid')
         for kind, state in states.items():
-            successful = state in COMPLETE_SALES_COLLECTION if kind == 'sales' else state == 'SUCCESS'
+            successful = state in COMPLETE_SKU_COLLECTION if kind in ('sales', 'inbound') else state == 'SUCCESS'
             if not successful:
                 issue('SYNC_FAILED' if state == 'FAILED' else 'INCOMPLETE_' + kind.upper(),
                       'Latest ' + kind + ' collection is not verified successful')
@@ -173,7 +174,7 @@ def calculate_skus(con, marketplace='US', asof=None, lead_days=35, target_days=7
                             for q in relevant_quality)
         for days in WINDOWS:
             count, observed = totals.get(f'days_{days}', 0), totals.get(f'units_{days}', 0)
-            complete = count == days and states['sales'] in COMPLETE_SALES_COLLECTION and not sales_quality
+            complete = count == days and states['sales'] in COMPLETE_SKU_COLLECTION and not sales_quality
             row[f'observed_sales_days_{days}d'] = count
             row[f'observed_sales_{days}d'] = observed if count else None
             row[f'sales_complete_{days}d'] = complete
@@ -216,7 +217,7 @@ def calculate_skus(con, marketplace='US', asof=None, lead_days=35, target_days=7
         if any(any(word in q['code'] for word in ('STOCK', 'INVENTORY')) for q in relevant_quality):
             row['inventory_complete'] = False
         active_units, working_units, eligible, unknown_eta, eta_after_horizon = 0, 0, 0, 0, 0
-        inbound_valid = states['inbound'] == 'SUCCESS' and not any(
+        inbound_valid = states['inbound'] in COMPLETE_SKU_COLLECTION and not any(
             any(word in q['code'] for word in ('INBOUND', 'SHIPMENT')) for q in relevant_quality)
         for shipment in incoming.get(sku, []):
             quantity, shipment_status = shipment.get('units'), shipment.get('status')
@@ -271,10 +272,13 @@ def calculate_skus(con, marketplace='US', asof=None, lead_days=35, target_days=7
         elif blockers:
             row['status'], row['stop_reason'] = 'DATA_REVIEW_REQUIRED', '; '.join(a['code'] + ': ' + a['reason'] for a in blockers)
         else:
-            daily = row['sales_30d'] / 30
-            raw = max(0, math.ceil(daily * (lead_days + target_days + safety_days)
-                                  - row['fulfillable'] - row['eligible_inbound']))
-            row['recommended_qty'] = math.ceil(max(raw, moq) / case_pack) * case_pack if raw else 0
+            # Rational demand avoids float values such as 121.00000000000001
+            # being rounded upward to an extra unit. Decimal configuration
+            # values retain their written precision through Fraction(str()).
+            daily = Fraction(row['sales_30d'], 30)
+            horizon = sum((Fraction(str(days)) for days in (lead_days, target_days, safety_days)), Fraction(0))
+            raw = max(0, math.ceil(daily * horizon - row['fulfillable'] - row['eligible_inbound']))
+            row['recommended_qty'] = ((max(raw, moq) + case_pack - 1) // case_pack) * case_pack if raw else 0
             row['status'] = 'ACTIVE' if parameters_confirmed else 'SCENARIO_ONLY'
             row['stop_reason'] = ''
         # Keep observed stockout risk visible for manually stopped SKUs, too.

@@ -86,6 +86,9 @@ COMMENTS = {
     'recommended_qty': '明确SKU停补为0；数据缺失或异常导致无法计算时保持空白。未确认参数的正数仅为试算。',
     'parameter_status': 'CONFIRMED 表示参数已明确确认；SCENARIO_ONLY 表示参数未确认，仅供试算，不得作为正式采购依据。',
     'units': '货件发运减已接收的剩余量；并非库存摘要之外的一份额外在途库存。',
+    'remaining': '货件发运减已接收的剩余量；已接收大于已发运或其他数量冲突时保持空白，不能以0抵扣。',
+    'quantity_shipped': 'Amazon货件行的已发运数量；只展示已验证的实际值，不填补缺失值。',
+    'quantity_received': 'Amazon货件行的已接收数量；若大于已发运则数量冲突，剩余在途未知。',
     'eta': '仅允许人工确认的ETA；未知为空，不使用 Amazon need-by/arrival 字段伪装已确认ETA。',
 }
 
@@ -125,6 +128,37 @@ def _inbound_details(con, marketplace, known_skus):
         'SELECT marketplace,sku,shipment_id,units,eta,status FROM inbound '
         'WHERE marketplace=? ORDER BY sku,shipment_id', (marketplace,)))
     return [row for row in values if row['sku'] in known_skus]
+
+
+def _inbound_exceptions(con, marketplace, known_skus):
+    if not _table_exists(con, 'sku_inbound_exception'):
+        return []
+    values = _dict_rows(con.execute(
+        'SELECT marketplace,sku,shipment_id,fnsku,status,quantity_shipped,quantity_received,remaining,code '
+        'FROM sku_inbound_exception WHERE marketplace=? ORDER BY sku,shipment_id,fnsku', (marketplace,)))
+    return [row for row in values if row['sku'] in known_skus]
+
+
+def _apply_inbound_exceptions(rows, exceptions, anomalies):
+    by_sku = {row['sku']: row for row in rows}
+    existing = {(row['sku'], row['code']) for row in anomalies}
+    for exception in exceptions:
+        row = by_sku[exception['sku']]
+        code = _code(exception.get('code')) or 'INBOUND_QUANTITY_CONFLICT'
+        row['inbound_complete'], row['data_complete'] = False, False
+        row['eligible_inbound'] = row['unknown_eta_inbound'] = None
+        row['recommended_qty'] = 0 if row['status'] == 'STOPPED' else None
+        if row['status'] != 'STOPPED':
+            row['status'] = 'DATA_REVIEW_REQUIRED'
+            row['recommendation_label'] = '数据异常：无法计算'
+            row['stop_reason'] = row.get('stop_reason') or '货件数量冲突；剩余在途为UNKNOWN，须人工核实。'
+        codes = set(row['anomaly_codes'].split('; ')) - {''}
+        row['anomaly_codes'] = '; '.join(sorted(codes | {code}))
+        if (row['sku'], code) not in existing:
+            anomalies.append({'marketplace': row['marketplace'], 'sku': row['sku'], 'asin': row.get('asin'),
+                              'code': code, 'reason': '货件已接收与已发运数量冲突；剩余在途未知，须核实。',
+                              'blocking': True, 'source': 'Inbound quantity exception evidence'})
+            existing.add((row['sku'], code))
 
 
 def _code(value):
@@ -299,13 +333,17 @@ def _summary(rows, anomalies):
     inbound_complete = sum(r['inbound_complete'] for r in rows)
     complete = sum(r['data_complete'] for r in rows)
     positive = [r for r in rows if _quantity(r['recommended_qty']) and r['recommended_qty'] > 0]
-    unknown = sum(not r['data_complete'] for r in rows)
+    eta_unknown = sum(_quantity(r.get('unknown_eta_inbound')) and r['unknown_eta_inbound'] > 0 for r in rows)
+    unknown = sum(not r['data_complete'] or r['recommended_qty'] is None
+                  or (_quantity(r.get('unknown_eta_inbound')) and r['unknown_eta_inbound'] > 0) for r in rows)
     return {
         'sku_count': count,
         'sold_sku_count': sum(r['sales_status'] == 'SOLD' for r in rows),
         'no_sales_sku_count': sum(r['sales_status'] == 'NO_SALES' for r in rows),
         'sales_unknown_sku_count': sum(r['sales_status'] == 'UNKNOWN' for r in rows),
         'unknown_data_sku_count': unknown,
+        'eta_unknown_sku_count': eta_unknown,
+        'unknown_data_definition': '数据完整率交集未通过、无法计算建议或存在正数量未知ETA的SKU并集；参数未确认但有有效试算数量不单独计为数据未知。',
         'inventory_positive_sku_count': sum(any(_quantity(r.get(k)) and r[k] > 0 for k in STOCK_FIELDS) for r in rows),
         'recommended_sku_count': len(positive),
         'recommended_units': sum(r['recommended_qty'] for r in positive),
@@ -351,8 +389,13 @@ def export_sku_report(rows, path, con, marketplace, settings, collection_audit=N
         raise ValueError('SKU report settings must be a mapping')
     details = _inventory_details(con, marketplace)
     values, anomalies = _sanitize_rows(rows, marketplace, details)
-    inbound = _inbound_details(con, marketplace, {row['sku'] for row in values})
+    cohort = {row['sku'] for row in values}
+    inbound = _inbound_details(con, marketplace, cohort)
+    inbound_exceptions = _inbound_exceptions(con, marketplace, cohort)
+    _apply_inbound_exceptions(values, inbound_exceptions, anomalies)
     summary = _summary(values, anomalies)
+    summary['inbound_quantity_conflict_sku_count'] = len({row['sku'] for row in inbound_exceptions})
+    summary['inbound_exception_line_count'] = len(inbound_exceptions)
     audit_rows, audit_summary = _safe_audit(collection_audit)
     summary.update(audit_summary)
     summary['excel_path'] = str(Path(path))
@@ -366,10 +409,14 @@ def export_sku_report(rows, path, con, marketplace, settings, collection_audit=N
         'inventory_observed_at', 'stock_age_days', 'inventory_source'), values)
     inbound_rows = []
     by_sku = {row['sku']: row for row in values}
+    exception_keys = {(row['sku'], row['shipment_id']) for row in inbound_exceptions}
     for original in inbound:
+        if (original['sku'], original['shipment_id']) in exception_keys:
+            continue
         row = dict(original)
         if not _quantity(row.get('units')):
             row['units'] = None
+        row['remaining'] = row['units']
         plan = by_sku[row['sku']]
         row.update(asin=plan.get('asin'), family=plan.get('family'),
                    inbound_rule=plan.get('inbound_rule'), inbound_complete=plan['inbound_complete'],
@@ -377,8 +424,25 @@ def export_sku_report(rows, path, con, marketplace, settings, collection_audit=N
         row['eta'] = row.get('eta') or None
         row['inventory_note'] = '货件余额与FBA库存入仓摘要核对；不得将两者重复相加抵扣。'
         inbound_rows.append(row)
+    for original in inbound_exceptions:
+        row = dict(original)
+        plan = by_sku[row['sku']]
+        for key in ('quantity_shipped', 'quantity_received'):
+            if not _quantity(row.get(key)):
+                row[key] = None
+        # A quantity exception cannot be resolved by clamping the subtraction
+        # to zero, even if a stale database row stored that fabricated value.
+        row.update(units=None, remaining=None, eta=None,
+                   asin=plan.get('asin'), family=plan.get('family'),
+                   inbound_rule=plan.get('inbound_rule'), inbound_complete=False,
+                   inbound_source=plan.get('inbound_source'),
+                   code=_code(row.get('code')) or 'INBOUND_QUANTITY_CONFLICT',
+                   inventory_note='数量冲突：已接收超过已发运；剩余在途为UNKNOWN，须人工核实，不填0。')
+        inbound_rows.append(row)
+    inbound_rows.sort(key=lambda row: (0 if row.get('code') else 1, row['sku'], row['shipment_id'], row.get('fnsku') or ''))
     _report_sheet(wb, '在途库存明细', IDENTITY_COLUMNS + (
-        'shipment_id', 'units', 'eta', 'status', 'inbound_rule', 'inbound_complete', 'inbound_source', 'inventory_note'), inbound_rows)
+        'shipment_id', 'fnsku', 'quantity_shipped', 'quantity_received', 'remaining', 'units', 'eta', 'status',
+        'code', 'inbound_rule', 'inbound_complete', 'inbound_source', 'inventory_note'), inbound_rows)
     _report_sheet(wb, '入仓库存核对', IDENTITY_COLUMNS + INBOUND_FIELDS + (
         'inventory_inbound', 'eligible_inbound', 'unknown_eta_inbound',
         'inbound_complete', 'inbound_rule', 'status', 'anomaly_codes'), values)

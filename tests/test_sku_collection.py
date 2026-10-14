@@ -292,3 +292,129 @@ def test_active_inbound_lines_eta_preserved_without_counting_inventory_counters(
     assert summary['inbound_rows'] == 1
     assert con.execute('SELECT units,eta FROM inbound').fetchone()[:] == (5, '2030-01-01')
     assert con.execute("SELECT fulfillable,reserved FROM stock WHERE sku='a'").fetchone()[:] == (5, 2)
+
+
+class InboundQuantityAPI:
+    marketplace = MARKETPLACE
+    endpoint = 'https://sellingpartnerapi-na.amazon.com'
+    orders_version = '2026-01-01'
+
+    def __init__(self):
+        self.calls = 0
+        self.collection_complete = {}
+        self.rows = [
+            {'ShipmentId': 's', 'SellerSKU': 'a', 'FulfillmentNetworkSKU': 'fn-a',
+             'QuantityShipped': 2, 'QuantityReceived': 3, 'BuyerName': 'PRIVATE-DO-NOT-PERSIST'},
+            {'ShipmentId': 's', 'SellerSKU': 'b', 'FulfillmentNetworkSKU': 'fn-b',
+             'QuantityShipped': 8, 'QuantityReceived': 3},
+        ]
+
+    def inbound_shipments(self):
+        self.calls += 1
+        return [{'ShipmentId': 's', 'ShipmentStatus': 'SHIPPED'}]
+
+    def shipment_items(self, identity):
+        return deepcopy(self.rows)
+
+
+def test_strict_inbound_default_rejects_but_opt_in_preserves_original_unknown_quantities(tmp_path):
+    from fba_replenishment.collection import collect_inbound_snapshot
+    from fba_replenishment.sku_collection import collect_sku_inbound_snapshot
+    api = InboundQuantityAPI()
+    with pytest.raises(CollectionQualityError) as error:
+        collect_inbound_snapshot(api, tmp_path)
+    assert error.value.code == 'RECEIVED_EXCEEDS_SHIPPED_QUANTITY'
+    assert not list(tmp_path.rglob('inbound.json'))
+    shipments, items, audit = collect_sku_inbound_snapshot(api, tmp_path)
+    assert items['s'][0]['QuantityShipped'] == 2 and items['s'][0]['QuantityReceived'] == 3
+    assert 'remaining' not in items['s'][0]
+    assert audit['quantity_exception_rows'] == audit['quantity_exception_sku_count'] == 1
+    assert audit['quantity_status'] == 'SUCCESS_WITH_SKU_EXCEPTIONS'
+    assert 'PRIVATE-DO-NOT-PERSIST' not in json.dumps(items)
+    assert len(list(tmp_path.rglob('inbound_sku_exceptions.json'))) == 1
+    before = api.calls
+    _, cached_items, cached_audit = collect_sku_inbound_snapshot(api, tmp_path)
+    assert api.calls == before and cached_audit['source'] == 'checkpoint'
+    assert cached_items['s'][0]['QuantityReceived'] == 3
+    # The strict default never reuses the permissive variant.
+    with pytest.raises(CollectionQualityError):
+        collect_inbound_snapshot(api, tmp_path)
+
+
+def test_identifiable_inbound_conflict_blocks_entire_bad_sku_but_not_good_sku(con):
+    api = InboundQuantityAPI()
+    shipments = api.inbound_shipments() + [{'ShipmentId': 'good-also-a', 'ShipmentStatus': 'SHIPPED'}]
+    lines = {'s': api.shipment_items('s'),
+             'good-also-a': [{'ShipmentId': 'good-also-a', 'SellerSKU': 'a',
+                             'QuantityShipped': 20, 'QuantityReceived': 0}]}
+    summary = reconcile(con, shipments=shipments, shipment_items=lines)
+    assert summary['inbound_quantity_conflict_sku_count'] == 1
+    assert summary['inbound_quantity_exception_rows'] == 1
+    assert con.execute("SELECT COUNT(*) FROM inbound WHERE sku='a'").fetchone()[0] == 0
+    assert con.execute("SELECT units FROM inbound WHERE sku='b'").fetchone()[0] == 5
+    bad = con.execute('SELECT * FROM sku_inbound_exception').fetchone()
+    assert bad['sku'] == 'a' and bad['quantity_shipped'] == 2 and bad['quantity_received'] == 3
+    assert bad['remaining'] is None and bad['code'] == 'INBOUND_QUANTITY_CONFLICT'
+    assert con.execute("SELECT code FROM data_quality_block WHERE sku='a'").fetchone()[0] == 'INBOUND_QUANTITY_CONFLICT'
+    assert con.execute("SELECT COUNT(*) FROM data_quality_block WHERE sku='b'").fetchone()[0] == 0
+    assert con.execute("SELECT status FROM sync_log WHERE kind='inbound'").fetchone()[0] == 'SUCCESS_WITH_SKU_EXCEPTIONS'
+    # Recovery clears only the system-owned conflict and its exception rows.
+    api.rows[0]['QuantityReceived'] = 1
+    reconcile(con, shipments=api.inbound_shipments(), shipment_items={'s': api.shipment_items('s')})
+    assert con.execute('SELECT COUNT(*) FROM sku_inbound_exception').fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM data_quality_block WHERE code='INBOUND_QUANTITY_CONFLICT'").fetchone()[0] == 0
+    assert con.execute("SELECT units FROM inbound WHERE sku='a'").fetchone()[0] == 1
+
+
+def test_inbound_exception_skus_not_in_stock_are_registered_without_family(con):
+    api = InboundQuantityAPI()
+    api.rows[0]['SellerSKU'] = 'historical-conflict'
+    summary = reconcile(con, shipments=api.inbound_shipments(), shipment_items={'s': api.shipment_items('s')})
+    assert summary['stock_missing_sku_count'] == 1
+    assert con.execute("SELECT family FROM sku WHERE sku='historical-conflict'").fetchone()[0] is None
+    assert con.execute("SELECT COUNT(*) FROM stock WHERE sku='historical-conflict'").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM sku_inbound_exception WHERE sku='historical-conflict'").fetchone()[0] == 1
+
+
+def test_exception_rows_and_blocks_rollback_together_on_local_write_failure(con):
+    api = InboundQuantityAPI()
+    reconcile(con, shipments=api.inbound_shipments(), shipment_items={'s': api.shipment_items('s')})
+    original = [tuple(row) for row in con.execute('SELECT * FROM sku_inbound_exception')]
+    snapshot_count = con.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0]
+    with con:
+        con.execute("CREATE TRIGGER reject_exceptions BEFORE INSERT ON sku_inbound_exception BEGIN SELECT RAISE(ABORT,'PRIVATE-ERROR'); END")
+    api.rows[0]['QuantityReceived'] = 9
+    with pytest.raises(CollectionQualityError) as error:
+        reconcile(con, shipments=api.inbound_shipments(), shipment_items={'s': api.shipment_items('s')})
+    assert error.value.code == 'LOCAL_RECONCILIATION_FAILED'
+    assert [tuple(row) for row in con.execute('SELECT * FROM sku_inbound_exception')] == original
+    assert con.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0] == snapshot_count
+    assert con.execute("SELECT units FROM inbound WHERE sku='b'").fetchone()[0] == 5
+    assert con.execute("SELECT code FROM data_quality_block WHERE sku='a'").fetchone()[0] == 'INBOUND_QUANTITY_CONFLICT'
+
+
+@pytest.mark.parametrize('kind,code', [('empty', 'INBOUND_ITEMS_INCOMPLETE'),
+                                     ('missing_sku', 'MISSING_SHIPMENT_ITEM_SKU'),
+                                     ('invalid_quantity', 'MISSING_SHIPMENT_RECEIVED_QUANTITY')])
+def test_opt_in_never_tolerates_unidentifiable_or_missing_active_lines(tmp_path, kind, code):
+    from fba_replenishment.sku_collection import collect_sku_inbound_snapshot
+    api = InboundQuantityAPI()
+    if kind == 'empty':
+        api.rows = []
+    elif kind == 'missing_sku':
+        api.rows[0].pop('SellerSKU')
+    else:
+        api.rows[0]['QuantityReceived'] = None
+    with pytest.raises(CollectionQualityError) as error:
+        collect_sku_inbound_snapshot(api, tmp_path)
+    assert error.value.code == code
+    assert not list(tmp_path.rglob('inbound_sku_exceptions.json'))
+
+
+def test_precheck_identifiable_inbound_quantity_conflict_is_soft(tmp_path):
+    api = ProbeAPI()
+    api.shipment_items = lambda identity: [{'ShipmentId': identity, 'SellerSKU': 'a',
+                                          'QuantityShipped': 2, 'QuantityReceived': 3}]
+    report, _, _ = precheck_sku(api, tmp_path, ASOF, 'UTC')
+    assert report['expansion_allowed'] and not report['hard_errors']
+    assert report['inbound_quantity_exception_rows'] == 1

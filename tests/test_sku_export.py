@@ -290,3 +290,120 @@ def test_data_sources_are_visible_and_no_recent_demand_is_not_a_stockout(tmp_pat
     assert read_rows(wb['7_30_60_90天销量'])[0]['sales_source'] == 'Orders API / AFN'
     assert read_rows(wb['FBA库存明细'])[0]['inventory_source'] == 'FBA Inventory API'
     assert not read_rows(wb['缺货风险'])
+
+
+def exception_table(con):
+    con.execute('''CREATE TABLE sku_inbound_exception (
+        marketplace TEXT NOT NULL, sku TEXT NOT NULL, shipment_id TEXT NOT NULL,
+        fnsku TEXT NOT NULL DEFAULT '',
+        status TEXT, quantity_shipped INTEGER, quantity_received INTEGER,
+        remaining INTEGER, code TEXT, PRIMARY KEY(marketplace,sku,shipment_id,fnsku))''')
+
+
+def test_received_exceeds_shipped_preserves_evidence_and_unknown_remaining(tmp_path):
+    db = tmp_path / 'data.db'
+    con = connect(db)
+    exception_table(con)
+    # A previously clamped balance cannot mask contradictory original evidence.
+    con.execute('INSERT INTO inbound VALUES(?,?,?,?,?,?)', ('US', 'conflict', 'FBA-C', 0, '', 'RECEIVING'))
+    con.execute('INSERT INTO inbound VALUES(?,?,?,?,?,?)', ('US', 'normal', 'FBA-N', 20, '2026-10-20', 'SHIPPED'))
+    con.execute('''INSERT INTO sku_inbound_exception
+        (marketplace,sku,shipment_id,status,quantity_shipped,quantity_received,remaining,code)
+        VALUES(?,?,?,?,?,?,?,?)''',
+                ('US', 'conflict', 'FBA-C', 'RECEIVING', 4, 5, None, 'INBOUND_QUANTITY_CONFLICT'))
+    con.commit()
+    con.close()
+    original = db.read_bytes()
+    readonly = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
+    wb, summary = export_rows(tmp_path, [plan('normal'), plan('conflict')], readonly)
+    detail = {r['sku']: r for r in read_rows(wb['在途库存明细'])}
+    assert len(detail) == 2
+    assert detail['conflict']['quantity_shipped'] == 4
+    assert detail['conflict']['quantity_received'] == 5
+    assert detail['conflict']['remaining'] is detail['conflict']['units'] is None
+    assert detail['conflict']['code'] == 'INBOUND_QUANTITY_CONFLICT'
+    assert detail['normal']['remaining'] == detail['normal']['units'] == 20
+    plans = {r['sku']: r for r in read_rows(wb['SKU补货总表'])}
+    assert plans['conflict']['recommended_qty'] is None
+    assert plans['conflict']['eligible_inbound'] is None
+    assert plans['conflict']['inbound_complete'] is False
+    assert plans['normal']['recommended_qty'] == 50
+    assert summary['data_collection_completeness'] == .5
+    assert summary['unknown_data_sku_count'] == summary['anomaly_sku_count'] == 1
+    assert db.read_bytes() == original
+    readonly.close()
+
+
+def test_exception_details_keep_missing_values_blank_and_filter_marketplace_and_cohort(tmp_path):
+    con = connect(tmp_path / 'data.db')
+    exception_table(con)
+    con.executemany('''INSERT INTO sku_inbound_exception
+        (marketplace,sku,shipment_id,status,quantity_shipped,quantity_received,remaining,code)
+        VALUES(?,?,?,?,?,?,?,?)''', [
+        ('US', 'sku-a', 'FBA-A', 'RECEIVING', None, 5, None, 'INBOUND_QUANTITY_CONFLICT'),
+        ('CA', 'sku-a', 'FBA-CA', 'RECEIVING', 4, 5, None, 'INBOUND_QUANTITY_CONFLICT'),
+        ('US', 'outside', 'FBA-X', 'RECEIVING', 4, 5, None, 'INBOUND_QUANTITY_CONFLICT')])
+    con.commit()
+    wb, summary = export_rows(tmp_path, [plan()], con)
+    detail = read_rows(wb['在途库存明细'])
+    assert len(detail) == 1
+    assert detail[0]['shipment_id'] == 'FBA-A'
+    assert detail[0]['quantity_shipped'] is detail[0]['remaining'] is None
+    assert detail[0]['quantity_received'] == 5
+    assert summary['sku_count'] == summary['unknown_data_sku_count'] == 1
+    con.close()
+
+
+def test_direct_stop_remains_zero_with_inbound_quantity_conflict(tmp_path):
+    con = connect(tmp_path / 'data.db')
+    exception_table(con)
+    con.execute('''INSERT INTO sku_inbound_exception
+        (marketplace,sku,shipment_id,status,quantity_shipped,quantity_received,remaining,code)
+        VALUES(?,?,?,?,?,?,?,?)''',
+                ('US', 'sku-a', 'FBA-C', 'RECEIVING', 4, 5, None, 'INBOUND_QUANTITY_CONFLICT'))
+    con.commit()
+    wb, summary = export_rows(tmp_path, [plan(status='STOPPED', stop_reason='Manual direct stop')], con)
+    stopped = read_rows(wb['已停补SKU'])[0]
+    assert stopped['recommended_qty'] == 0
+    assert stopped['stop_reason'] == 'Manual direct stop'
+    assert read_rows(wb['在途库存明细'])[0]['remaining'] is None
+    assert summary['unknown_data_sku_count'] == summary['stopped_sku_count'] == 1
+    con.close()
+
+
+def test_unknown_data_count_is_union_of_missing_data_missing_result_and_unknown_eta(tmp_path):
+    rows = [plan('scenario-valid'),
+            plan('missing-data', data_complete=False, sales_complete_90d=False),
+            plan('eta-unknown', unknown_eta_inbound=20, inbound_rule='exclude'),
+            plan('result-blocked', recommended_qty=None, status='DATA_REVIEW_REQUIRED'),
+            plan('known-zero', recommended_qty=0),
+            plan('stopped', status='STOPPED', recommended_qty=0)]
+    wb, summary = export_rows(tmp_path, rows)
+    assert summary['unknown_data_sku_count'] == 3
+    assert summary['eta_unknown_sku_count'] == 1
+    assert summary['sales_unknown_sku_count'] == 1
+    assert summary['complete_sku_count'] == 5
+    assert summary['data_collection_completeness'] == 5 / 6
+    items = {r['sku']: r for r in read_rows(wb['SKU补货总表'])}
+    assert items['scenario-valid']['recommended_qty'] == items['eta-unknown']['recommended_qty'] == 50
+    assert items['eta-unknown']['unknown_eta_inbound'] == 20
+    assert items['known-zero']['recommended_qty'] == items['stopped']['recommended_qty'] == 0
+    assert items['result-blocked']['recommended_qty'] is None
+
+
+def test_multiple_fnsku_exceptions_keep_all_evidence_but_count_one_unknown_sku(tmp_path):
+    con = connect(tmp_path / 'data.db')
+    exception_table(con)
+    con.executemany('INSERT INTO sku_inbound_exception VALUES(?,?,?,?,?,?,?,?,?)', [
+        ('US', 'sku-a', 'FBA-A', 'FN-1', 'RECEIVING', 4, 5, None, 'INBOUND_QUANTITY_CONFLICT'),
+        ('US', 'sku-a', 'FBA-A', 'FN-2', 'RECEIVING', 6, 8, None, 'INBOUND_QUANTITY_CONFLICT')])
+    con.commit()
+    wb, summary = export_rows(tmp_path, [plan()], con)
+    detail = read_rows(wb['在途库存明细'])
+    assert len(detail) == 2
+    assert {row['fnsku'] for row in detail} == {'FN-1', 'FN-2'}
+    assert all(row['remaining'] is row['units'] is None for row in detail)
+    assert summary['inbound_quantity_conflict_sku_count'] == summary['unknown_data_sku_count'] == 1
+    assert summary['inbound_exception_line_count'] == 2
+    assert len(read_rows(wb['数据异常'])) == 1
+    con.close()
