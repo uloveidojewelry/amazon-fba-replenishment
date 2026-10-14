@@ -6,6 +6,11 @@ Auto SKU Discovery V1.0 persists marketplace/SellerSKU identity and history, sep
 candidate and approved mappings, inherits family stops and produces review workbooks.
 See [自动 SKU 发现与每日运行](docs/AUTO_SKU_DISCOVERY.zh-CN.md).
 
+Finite-set batch review adds evidence based priority queues, explicit family approval
+or rejection, confirmed stop-list imports and immutable before/after audits. See
+[SKU 系列批量审核与导入](docs/SKU_BATCH_REVIEW.zh-CN.md). Preparing a queue is offline;
+exact reference matches and naming candidates remain unapproved.
+
 ## Install and test
 
 ```bash

@@ -57,6 +57,32 @@ def main():
     rule.add_argument('--pattern', required=True)
     rule.add_argument('--family-group', type=int, default=1)
     rule.add_argument('--approved-by', required=True)
+    batch = commands.add_parser('prepare-batch-review', help='Offline prioritized finite-set review; no API requests or approvals')
+    batch.add_argument('--output-dir', default='output/batch-review')
+    batch.add_argument('--sales-sample', help='Existing sanitized read-only order sample; absence is UNKNOWN')
+    batch.add_argument('--asof', help='Last complete day for recent sales evidence')
+    scope = commands.add_parser('create-review-scope', help='Freeze a human-specified SKU set; does not approve future prefix matches')
+    scope.add_argument('--family', required=True)
+    scope.add_argument('--sku', action='append', required=True)
+    scope.add_argument('--created-by', required=True)
+    bulk = commands.add_parser('approve-batch', help='Approve only the exact frozen set after human confirmation')
+    bulk.add_argument('--manifest-id', required=True)
+    bulk.add_argument('--member-digest', required=True)
+    bulk.add_argument('--family', required=True)
+    bulk.add_argument('--reviewer', required=True)
+    bulk.add_argument('--reason', required=True)
+    bulk.add_argument('--confirm-scope', action='store_true')
+    bulk.add_argument('--allow-remap', action='store_true')
+    bulk.add_argument('--resolve-conflicts', action='store_true')
+    workbook = commands.add_parser('import-batch-review', help='Apply explicit reviewed workbook decisions atomically')
+    workbook.add_argument('xlsx')
+    workbook.add_argument('--reviewer', required=True)
+    workbook.add_argument('--confirm-reviewed', action='store_true')
+    workbook.add_argument('--allow-remap', action='store_true')
+    workbook.add_argument('--resolve-conflicts', action='store_true')
+    stops = commands.add_parser('import-stop-list', help='Import APPROVED TRUE stops locally; false never resumes a SKU')
+    stops.add_argument('file')
+    stops.add_argument('--reviewer', required=True)
     plan = commands.add_parser('plan')
     for name, default in [('lead-days', 35), ('target-days', 75), ('safety-days', 0), ('moq', 1), ('case-pack', 1), ('max-stock-age-days', 2)]:
         plan.add_argument('--' + name, type=int, default=default)
@@ -73,7 +99,8 @@ def main():
         parser.error('Real SKU review requires --confirm-read-only')
     if args.command == 'sync' and not args.mock and not args.confirm_read_only:
         parser.error('Live sync requires --confirm-read-only; use --mock for offline data')
-    db = args.db or ('output/sku-review/review.db' if args.command in ('review-skus', 'discover-skus') else
+    batch_commands = ('prepare-batch-review','create-review-scope','approve-batch','import-batch-review','import-stop-list')
+    db = args.db or ('output/sku-review/review.db' if args.command in ('review-skus', 'discover-skus')+batch_commands else
                     'output/mock-fba.db' if args.command == 'sync' and args.mock else 'data/fba.db')
     Path(db).parent.mkdir(parents=True, exist_ok=True)
     con = connect(db)
@@ -136,9 +163,48 @@ def main():
             register_approved_rule(con, args.marketplace, SPAPIConfig.from_env().marketplace,
                                    args.name, args.pattern, args.family_group, args.approved_by)
             print('Naming rule approved locally; no SKU mapping was automatically approved')
+        elif args.command == 'prepare-batch-review':
+            from .batch_review import prepare_batch_review
+            result=prepare_batch_review(con,args.output_dir,args.marketplace,args.sales_sample,args.asof)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
+        elif args.command == 'create-review-scope':
+            from .batch_decisions import create_review_manifest
+            binding=con.execute('SELECT api_marketplace FROM marketplace_binding WHERE marketplace=?',(args.marketplace,)).fetchone()
+            if not binding:
+                raise ValueError('A bound discovery baseline is required')
+            result=create_review_manifest(con,args.marketplace,binding['api_marketplace'],args.family,args.sku,
+                                          created_by=args.created_by,batch_eligible=True)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
+        elif args.command == 'approve-batch':
+            from .batch_decisions import approve_batch
+            exists=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_review_manifest'").fetchone()
+            if not exists:
+                raise ValueError('Prepare an explicit review scope before approving a batch')
+            scope=con.execute('SELECT marketplace FROM batch_review_manifest WHERE manifest_id=?',(args.manifest_id,)).fetchone()
+            if not scope or scope['marketplace']!=args.marketplace:
+                raise ValueError('Batch scope does not belong to the selected marketplace')
+            result=approve_batch(con,args.manifest_id,args.member_digest,args.family,args.reviewer,
+                                 confirm=args.confirm_scope,allow_remap=args.allow_remap,
+                                 resolve_conflicts=args.resolve_conflicts,reason=args.reason)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
+        elif args.command == 'import-batch-review':
+            from .batch_review import import_batch_review
+            result=import_batch_review(con,args.xlsx,args.reviewer,confirm=args.confirm_reviewed,
+                                       marketplace=args.marketplace,allow_remap=args.allow_remap,
+                                       resolve_conflicts=args.resolve_conflicts)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
+        elif args.command == 'import-stop-list':
+            from .batch_review import import_confirmed_stops
+            result=import_confirmed_stops(con,args.file,args.reviewer,args.marketplace)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
     except SPAPIError as error:
         parser.exit(1, f'{error.code}: {error}. {error.hint}\n')
-    except (ValueError, KeyError, TypeError):
+    except ValueError as error:
+        if args.command in batch_commands:
+            # Batch validators use predefined local messages, never API bodies.
+            parser.exit(1, f'Review validation failed: {error}\n')
+        parser.exit(1, 'Operation failed: check required bindings, inputs, API permissions and local Sync Log.\n')
+    except (KeyError, TypeError):
         # Avoid printing potentially sensitive exception bodies from external data.
         parser.exit(1, 'Operation failed: check required bindings, inputs, API permissions and local Sync Log.\n')
     finally:

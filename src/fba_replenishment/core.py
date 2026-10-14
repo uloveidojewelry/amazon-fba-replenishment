@@ -184,6 +184,14 @@ def resume(con, marketplace, sku, approved_by):
 def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0,
               moq=1, case_pack=1, asof=None, max_stock_age_days=2):
     """30 calendar days ending on asof (inclusive); default last completed UTC day."""
+    scheduled = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='batch_scheduled_stop'").fetchone()
+    if scheduled:
+        instant=datetime.now(timezone.utc)
+        due=any(row['effective_date']<=instant.astimezone(ZoneInfo(row['effective_timezone'])).date().isoformat()
+                for row in con.execute("SELECT effective_date,effective_timezone FROM batch_scheduled_stop WHERE marketplace=? AND status='PENDING'", (marketplace,)))
+        if due:
+            from .batch_decisions import refresh_pending_stops
+            refresh_pending_stops(con)
     binding = con.execute('SELECT sales_timezone FROM marketplace_binding WHERE marketplace=?', (marketplace,)).fetchone()
     sales_timezone = (binding['sales_timezone'] if binding else None) or 'UTC'
     asof = date.fromisoformat(asof) if asof else datetime.now(ZoneInfo(sales_timezone)).date() - timedelta(days=1)
@@ -199,13 +207,18 @@ def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0
     start, end = (asof - timedelta(days=29)).isoformat(), asof.isoformat()
     due = (asof + timedelta(days=lead_days)).isoformat()
     failed_sources = []
+    source_states = {}
     for kind in ('stock', 'sales', 'inbound'):
         latest = con.execute('SELECT status FROM sync_log WHERE marketplace=? AND kind=? ORDER BY id DESC LIMIT 1', (marketplace, kind)).fetchone()
+        source_states[kind] = latest['status'] if latest else None
         if latest and latest['status'] == 'FAILED':
             failed_sources.append(kind)
+    discovery_table=con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='discovery_sku'").fetchone()
+    discovered_skus={r['sku'] for r in con.execute('SELECT sku FROM discovery_sku WHERE marketplace=?',(marketplace,))} if discovery_table else set()
     rows = []
     for mapped in con.execute('SELECT * FROM sku WHERE marketplace=? ORDER BY family,sku', (marketplace,)):
         sku, family = mapped['sku'], mapped['family']
+        discovered=sku in discovered_skus
         stock = con.execute('SELECT * FROM stock WHERE marketplace=? AND sku=?', (marketplace, sku)).fetchone()
         sales = con.execute('SELECT SUM(units) n,COUNT(*) days FROM sales WHERE marketplace=? AND sku=? AND day>=? AND day<=?', (marketplace, sku, start, end)).fetchone()
         complete_sales = sales['days'] == 30
@@ -236,6 +249,8 @@ def calculate(con, marketplace='US', lead_days=35, target_days=75, safety_days=0
             status, reason = 'STALE_STOCK', 'Inventory snapshot exceeds freshness limit'
         elif sales['days'] != 30:
             status, reason = 'INCOMPLETE_SALES', f"Only {sales['days']}/30 daily totals; missing dates are not zero"
+        elif discovered and source_states['inbound'] != 'SUCCESS':
+            status, reason = 'INCOMPLETE_INBOUND', 'No verified inbound collection; missing shipment/ETA evidence is not zero'
         elif unknown_eta:
             status, reason = 'INBOUND_REVIEW_REQUIRED', 'Active inbound has unknown ETA'
         else:

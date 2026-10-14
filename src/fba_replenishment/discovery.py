@@ -193,6 +193,17 @@ def _candidate(sku, asin, sources, catalog, rules, allow_fallback=True):
             'match_status': 'AUTO_MATCHED_PENDING_REVIEW' if candidates else 'UNMATCHED'}
 
 
+def _confirmed_stop_family(row):
+    """Candidates never establish a persistent series stop for another family."""
+    if row['family'] and (row['mapping_status'] == 'APPROVED' or
+                          (row['approved_by'] and row['approved_at'])):
+        return row['family']
+    if (not row['family'] and row['mapping_basis'] == 'APPROVED_NAMING_RULE_CANDIDATE'
+            and not row['mapping_conflict']):
+        return row['effective_family']
+    return None
+
+
 def _refresh_safety(con, marketplace):
     rows = con.execute('SELECT * FROM discovery_sku WHERE marketplace=?', (marketplace,)).fetchall()
     family_stops = {r['family'] for r in con.execute(
@@ -200,19 +211,24 @@ def _refresh_safety(con, marketplace):
     direct = {r['sku'] for r in con.execute(
         'SELECT sku FROM stop_flag WHERE marketplace=? AND active=1', (marketplace,))}
     disabled = {r['sku'] for r in con.execute('SELECT sku FROM sku WHERE marketplace=? AND enabled=0', (marketplace,))}
-    # Existing core stops on pending children also protect their candidate family.
+    # A confirmed family is policy. An unreviewed candidate is only evidence for
+    # blocking that pending SKU; it cannot stop an unrelated approved family.
     for row in rows:
         if row['sku'] in direct | disabled:
-            families = set(json.loads(row['candidate_families'])) | {row['family'], row['effective_family']}
-            for family in families - {None, ''}:
+            family = _confirmed_stop_family(row)
+            if family:
                 family_stops.add(family)
                 con.execute('''INSERT INTO family_stop VALUES(?,?,?,1)
                     ON CONFLICT(marketplace,family,trigger_sku) DO UPDATE SET active=1''',
                             (marketplace, family, row['sku']))
     for row in rows:
         sku = row['sku']
-        candidates = set(json.loads(row['candidate_families'])) | {row['family'], row['effective_family']}
-        stopped = sku in direct | disabled or bool((candidates - {None, ''}) & family_stops)
+        confirmed_family = _confirmed_stop_family(row)
+        if confirmed_family:
+            stopped = sku in direct | disabled or confirmed_family in family_stops
+        else:
+            candidates = set(json.loads(row['candidate_families'])) | {row['effective_family']}
+            stopped = sku in direct | disabled or bool((candidates - {None, ''}) & family_stops)
         if stopped:
             replenishment = 'STOPPED'
         elif row['mapping_conflict']:
@@ -491,8 +507,8 @@ def mark_stop(con, marketplace, sku, reason, observed_at=None):
     with con:
         con.execute('INSERT INTO stop_flag VALUES(?,?,?,?,1) ON CONFLICT(marketplace,sku) DO UPDATE SET reason=excluded.reason,created_at=excluded.created_at,active=1',
                     (marketplace, sku, reason, timestamp))
-        families = set(json.loads(row['candidate_families'])) | {row['family'], row['effective_family']}
-        for family in families - {None, ''}:
+        family = _confirmed_stop_family(row)
+        if family:
             con.execute('INSERT OR REPLACE INTO family_stop VALUES(?,?,?,1)', (marketplace, family, sku))
         _refresh_safety(con, marketplace)
         _history(con, timestamp, row['api_marketplace'], marketplace, sku, 'STOP', {'reason': reason})
