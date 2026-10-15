@@ -101,7 +101,14 @@ def main():
     sku_local = commands.add_parser('sku-plan', help='Recalculate independent SKU scenarios from previously collected local data')
     sku_local.add_argument('--source-db', default='output/sku-review/review.db', help='Observe current effective original SKU stops without importing or resuming')
     sku_local.add_argument('--output', default='output/sku-independent-90d/sku_replenishment_90d.xlsx')
-    for command in (sku_sync,sku_local):
+    monthly = commands.add_parser('monthly-plan', help='Offline report using uploaded monthly demand and validated US SKU snapshots; no API requests')
+    monthly.add_argument('xlsx', help='User monthly units workbook; never imported into API sales history')
+    monthly.add_argument('--source-db', default='output/sku-review/review.db')
+    monthly.add_argument('--output', default='output/monthly-sales/monthly_replenishment.xlsx')
+    monthly.add_argument('--monthly-days', type=int, default=30, help='Explicit normalization period; 30 is an assumed standard month')
+    monthly.add_argument('--monthly-period-status', choices=['ASSUMED_30_DAY_MONTH','USER_CONFIRMED_PERIOD'], default='ASSUMED_30_DAY_MONTH')
+    monthly.add_argument('--monthly-scope-confirmed', action='store_true', help='Use only after the human confirms this upload contains US unit sales')
+    for command in (sku_sync,sku_local,monthly):
         command.add_argument('--asof', help='Last completed US business date')
         for name, default in [('lead-days',35),('target-days',75),('safety-days',0),('moq',1),('case-pack',1),('max-stock-age-days',2)]:
             command.add_argument('--'+name,type=int,default=default)
@@ -113,6 +120,21 @@ def main():
     plan.add_argument('--asof', help='Last complete sales day; default previous day in synced sales timezone (UTC for CSV)')
     plan.add_argument('--output', default='output/replenishment.xlsx')
     args = parser.parse_args()
+    if args.command == 'monthly-plan':
+        from .monthly_runner import run_monthly_report
+        if args.marketplace != 'US':
+            parser.error('Monthly upload reports support only the US marketplace')
+        settings = {key:getattr(args,key) for key in ('lead_days','target_days','safety_days','moq','case_pack','max_stock_age_days','inbound_rule','parameters_confirmed')}
+        try:
+            result = run_monthly_report(
+                args.xlsx, args.db or 'output/sku-independent-90d/sku_plan.db', args.output,
+                source_path=args.source_db, asof=args.asof, monthly_days=args.monthly_days,
+                monthly_period_status=args.monthly_period_status,
+                monthly_scope_confirmed=args.monthly_scope_confirmed, settings=settings)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+        except (ValueError, KeyError, TypeError, OSError, SPAPIError):
+            parser.exit(1,'Monthly report failed local validation; source data and stop decisions were not changed.\n')
+        return
     if args.command in ('sku-sync-plan','sku-plan'):
         from .sku_runner import SafeCountSession, run_sku_collection, apply_latest_source_stops
         from .sku_plan import calculate_skus

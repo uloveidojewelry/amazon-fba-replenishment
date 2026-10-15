@@ -22,6 +22,10 @@ in its source database, and calculates SKU scenarios without family approval or
 family stop inheritance. Explicit SKU stops remain effective. See
 [单 SKU 独立统计、恢复与试算参数](docs/INDEPENDENT_SKU.zh-CN.md).
 
+`monthly-plan` uses uploaded monthly SKU unit sales as the demand baseline and
+keeps API sales windows as comparison evidence. It preserves all direct SKU stops
+and data safety checks. See [按月销量整理补货](docs/MONTHLY_SALES.zh-CN.md).
+
 ## Install and test
 
 ```bash
